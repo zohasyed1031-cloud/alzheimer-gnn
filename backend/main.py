@@ -9,6 +9,7 @@ import pandas as pd
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import gc
 
 from torch_geometric.nn import (
     GCNConv,
@@ -51,7 +52,7 @@ MODEL_DIR = BASE_DIR / "model"
 device = torch.device(
     "cuda" if torch.cuda.is_available() else "cpu"
 )
-
+torch.set_num_threads(1)
 
 # ============================================================
 # LOAD MODEL FILES
@@ -516,7 +517,7 @@ def get_top_gene_signals(sample_values):
 
 
 # ============================================================
-# RESEARCH DATASET PREDICTION
+# RESEARCH DATASET PREDICTION - MEMORY OPTIMIZED
 #
 # Expected:
 #
@@ -531,28 +532,25 @@ async def predict(
 
     try:
 
-        contents = await file.read()
+        # ----------------------------------------------------
+        # READ CSV DIRECTLY FROM UPLOAD
+        # Avoid await file.read() because it creates another
+        # large copy of the entire CSV in RAM.
+        # ----------------------------------------------------
 
+        uploaded_file = file.file
 
-        if not contents:
-
-            raise HTTPException(
-                status_code=400,
-                detail="Uploaded file is empty."
-            )
-
-
-        df = pd.read_csv(
-            io.BytesIO(contents)
+        # Read only the header first
+        header_df = pd.read_csv(
+            uploaded_file,
+            nrows=0
         )
 
-
-        df = clean_columns(
-            df
+        header_df = clean_columns(
+            header_df
         )
 
-
-        if "Gene_Symbol" not in df.columns:
+        if "Gene_Symbol" not in header_df.columns:
 
             raise HTTPException(
                 status_code=400,
@@ -562,26 +560,13 @@ async def predict(
                 )
             )
 
+        sample_columns = [
+            column
+            for column in header_df.columns
+            if column != "Gene_Symbol"
+        ]
 
-        # Remove duplicate genes
-        df = df.drop_duplicates(
-            subset=["Gene_Symbol"]
-        )
-
-
-        df["Gene_Symbol"] = (
-            df["Gene_Symbol"]
-            .astype(str)
-            .str.strip()
-        )
-
-
-        df = df.set_index(
-            "Gene_Symbol"
-        )
-
-
-        if len(df.columns) == 0:
+        if len(sample_columns) == 0:
 
             raise HTTPException(
                 status_code=400,
@@ -591,6 +576,48 @@ async def predict(
                 )
             )
 
+        # ----------------------------------------------------
+        # READ DATA WITH FLOAT32
+        #
+        # float64 = 8 bytes/value
+        # float32 = 4 bytes/value
+        #
+        # This roughly halves expression-data memory.
+        # ----------------------------------------------------
+
+        uploaded_file.seek(0)
+
+        dtype_map = {
+            column: np.float32
+            for column in sample_columns
+        }
+
+        df = pd.read_csv(
+            uploaded_file,
+            dtype=dtype_map
+        )
+
+        df = clean_columns(
+            df
+        )
+
+        # ----------------------------------------------------
+        # REMOVE DUPLICATE GENES
+        # ----------------------------------------------------
+
+        df = df.drop_duplicates(
+            subset=["Gene_Symbol"]
+        )
+
+        df["Gene_Symbol"] = (
+            df["Gene_Symbol"]
+            .astype(str)
+            .str.strip()
+        )
+
+        df = df.set_index(
+            "Gene_Symbol"
+        )
 
         # ----------------------------------------------------
         # CHECK REQUIRED GENES
@@ -600,13 +627,11 @@ async def predict(
 
             gene
 
-            for gene
-            in selected_genes
+            for gene in selected_genes
 
             if gene not in df.index
 
         ]
-
 
         if missing_genes:
 
@@ -631,40 +656,57 @@ async def predict(
                 }
             )
 
+        # ----------------------------------------------------
+        # SELECT ONLY THE 1000 GENES NEEDED BY THE GNN
+        # ----------------------------------------------------
 
         expression = df.loc[
             selected_genes
         ]
 
+        # ----------------------------------------------------
+        # CHECK FOR MISSING / NON-NUMERIC VALUES
+        #
+        # Because expression columns were read as float32,
+        # invalid values become NaN.
+        # ----------------------------------------------------
+
+        if expression.isna().any().any():
+
+            bad_columns = expression.columns[
+                expression.isna().any()
+            ]
+
+            bad_sample = str(
+                bad_columns[0]
+            )
+
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "Non-numeric or missing values "
+                    f"found in sample {bad_sample}."
+                )
+            )
+
+        # ----------------------------------------------------
+        # RUN GNN
+        # ----------------------------------------------------
 
         results = []
 
-
         for sample_id in expression.columns:
 
-            sample = pd.to_numeric(
-                expression[sample_id],
-                errors="coerce"
+            sample_values = (
+                expression[sample_id]
+                .to_numpy(dtype=np.float32)
             )
-
-
-            if sample.isna().any():
-
-                raise HTTPException(
-                    status_code=400,
-                    detail=(
-                        "Non-numeric or missing values "
-                        f"found in sample {sample_id}."
-                    )
-                )
-
 
             prediction_result = (
                 run_gnn_prediction(
-                    sample.values
+                    sample_values
                 )
             )
-
 
             results.append({
 
@@ -688,9 +730,8 @@ async def predict(
 
             })
 
-
         # ----------------------------------------------------
-        # DATASET ANALYSIS
+        # DATASET BASIC INFORMATION
         # ----------------------------------------------------
 
         number_of_genes = len(
@@ -701,41 +742,37 @@ async def predict(
             df.columns
         )
 
-
-        numeric_df = df.apply(
-            pd.to_numeric,
-            errors="coerce"
-        )
-
+        # ----------------------------------------------------
+        # DATASET STATISTICS
+        #
+        # Work directly on the original float32 dataframe.
+        # Do NOT create another numeric_df copy.
+        # ----------------------------------------------------
 
         missing_values = int(
-            numeric_df
-            .isna()
+            df.isna()
             .sum()
             .sum()
         )
-
 
         mean_expression = float(
-            numeric_df
-            .mean()
+            df.to_numpy(dtype=np.float32)
             .mean()
         )
 
+        # ----------------------------------------------------
+        # TOP VARIABLE GENES
+        # ----------------------------------------------------
 
-        gene_variances = numeric_df.var(
-            axis=1
+        gene_variances = df.var(
+            axis=1,
+            ddof=1
         )
-
 
         top_variable_genes_series = (
             gene_variances
-            .sort_values(
-                ascending=False
-            )
-            .head(10)
+            .nlargest(10)
         )
-
 
         top_variable_genes = [
 
@@ -757,27 +794,23 @@ async def predict(
 
         ]
 
-
         # ----------------------------------------------------
         # EXPRESSION OVERVIEW
+        #
+        # Only take the first sample and first 30 genes.
         # ----------------------------------------------------
 
         expression_overview = []
 
+        if number_of_samples > 0:
 
-        if len(numeric_df.columns) > 0:
-
-            first_sample = (
-                numeric_df.iloc[:, 0]
-            )
-
+            first_sample = df.iloc[:, 0]
 
             overview_genes = (
                 first_sample
                 .dropna()
                 .head(30)
             )
-
 
             expression_overview = [
 
@@ -799,6 +832,17 @@ async def predict(
 
             ]
 
+        # ----------------------------------------------------
+        # FREE LARGE OBJECTS BEFORE RETURNING
+        # ----------------------------------------------------
+
+        del df
+        del expression
+        del gene_variances
+
+        # ----------------------------------------------------
+        # RETURN RESULT
+        # ----------------------------------------------------
 
         return {
 
@@ -846,546 +890,6 @@ async def predict(
 
             "results":
                 results
-
-        }
-
-
-    except HTTPException:
-
-        raise
-
-
-    except Exception as e:
-
-        raise HTTPException(
-            status_code=500,
-            detail=str(e)
-        )
-
-
-# ============================================================
-# PATIENT PREDICTION
-#
-# Expected patient CSV:
-#
-# Patient_ID
-# Sample_Type
-# AB42
-# AB40
-# pTau181
-# pTau217
-# AB42_AB40_Ratio
-# ABCA7
-# ABCE1
-# ...
-#
-# NO Gene_Symbol column is required.
-#
-# Diagnosis is OPTIONAL and ignored during prediction.
-#
-# ============================================================
-
-@app.post("/patient-predict")
-async def patient_predict(
-    file: UploadFile = File(...)
-):
-
-    try:
-
-        contents = await file.read()
-
-
-        if not contents:
-
-            raise HTTPException(
-                status_code=400,
-                detail="Patient CSV is empty."
-            )
-
-
-        # ----------------------------------------------------
-        # READ CSV
-        # ----------------------------------------------------
-
-        try:
-
-            df = pd.read_csv(
-                io.BytesIO(contents)
-            )
-
-        except Exception as e:
-
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    "Could not read the patient CSV. "
-                    f"Error: {str(e)}"
-                )
-            )
-
-
-        # Clean spaces from column names
-        df = clean_columns(
-            df
-        )
-
-
-        # ----------------------------------------------------
-        # BASIC INFORMATION
-        # ----------------------------------------------------
-
-        if len(df.columns) == 0:
-
-            raise HTTPException(
-                status_code=400,
-                detail="Patient CSV contains no columns."
-            )
-
-
-        if len(df) == 0:
-
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    "Patient CSV contains no "
-                    "patient records."
-                )
-            )
-
-
-        # ----------------------------------------------------
-        # REQUIRED PATIENT COLUMNS
-        # ----------------------------------------------------
-
-        required_patient_columns = [
-            "Patient_ID",
-            "Sample_Type"
-        ]
-
-
-        missing_patient_columns = [
-
-            column
-
-            for column
-            in required_patient_columns
-
-            if column not in df.columns
-
-        ]
-
-
-        if missing_patient_columns:
-
-            raise HTTPException(
-                status_code=400,
-                detail={
-
-                    "message":
-                        "Patient CSV is missing required columns.",
-
-                    "missing_columns":
-                        missing_patient_columns,
-
-                    "required_columns":
-                        required_patient_columns
-
-                }
-            )
-
-
-        # ----------------------------------------------------
-        # ONE PATIENT PER CSV
-        # ----------------------------------------------------
-
-        if len(df) > 1:
-
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    "Please upload one patient record "
-                    "at a time."
-                )
-            )
-
-
-        patient = df.iloc[0]
-
-
-        # ----------------------------------------------------
-        # PATIENT ID
-        # ----------------------------------------------------
-
-        patient_id = str(
-            patient["Patient_ID"]
-        ).strip()
-
-
-        if not patient_id:
-
-            raise HTTPException(
-                status_code=400,
-                detail="Patient_ID cannot be empty."
-            )
-
-
-        # ----------------------------------------------------
-        # SAMPLE TYPE
-        # ----------------------------------------------------
-
-        sample_type = str(
-            patient["Sample_Type"]
-        ).strip()
-
-
-        if sample_type.lower() not in [
-            "blood",
-            "saliva"
-        ]:
-
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    "Sample_Type must be either "
-                    "'Blood' or 'Saliva'."
-                )
-            )
-
-
-        sample_type = (
-
-            "Blood"
-
-            if sample_type.lower() == "blood"
-
-            else "Saliva"
-
-        )
-
-
-        # ----------------------------------------------------
-        # CHECK REQUIRED 1000 GENES
-        #
-        # Gene_Symbol IS NOT required here.
-        # The genes are expected to be individual columns.
-        # ----------------------------------------------------
-
-        (
-            missing_genes,
-            gene_column_map
-        ) = check_patient_genes(
-            df
-        )
-
-
-        if missing_genes:
-
-         raise HTTPException(
-         status_code=400,
-         detail={
-            "message": (
-                "The patient CSV is missing "
-                "genes required by the trained GNN."
-            ),
-
-            "missing_count": len(missing_genes),
-
-            "required_genes": len(selected_genes),
-
-            "available_gene_columns": len(gene_column_map),
-
-            "total_csv_columns": len(df.columns),
-
-            "example_missing_genes": missing_genes[:50],
-
-            "first_available_columns": [
-                str(column)
-                for column in df.columns[:30]
-            ],
-
-            "solution": (
-                "The patient CSV must contain expression "
-                "values for the same 1000 genes used during "
-                "GNN training."
-            )
-        }
-    )
-
-
-        # ----------------------------------------------------
-        # EXTRACT GENE VALUES
-        # ----------------------------------------------------
-
-        gene_values = []
-
-
-        for gene in selected_genes:
-
-            actual_column = (
-                gene_column_map[gene]
-            )
-
-
-            value = pd.to_numeric(
-                patient[actual_column],
-                errors="coerce"
-            )
-
-
-            if pd.isna(value):
-
-                raise HTTPException(
-                    status_code=400,
-                    detail=(
-                        f"Invalid or missing gene value "
-                        f"for {gene}."
-                    )
-                )
-
-
-            if not np.isfinite(
-                float(value)
-            ):
-
-                raise HTTPException(
-                    status_code=400,
-                    detail=(
-                        f"Invalid numeric value "
-                        f"for gene {gene}."
-                    )
-                )
-
-
-            gene_values.append(
-                float(value)
-            )
-
-
-        # ----------------------------------------------------
-        # BIOMARKERS
-        # ----------------------------------------------------
-
-        biomarkers = {}
-
-
-        # Create case-insensitive biomarker lookup
-        biomarker_lookup = {
-
-            str(column)
-            .strip()
-            .upper():
-
-            column
-
-            for column
-            in df.columns
-
-        }
-
-
-        for column in BIOMARKER_COLUMNS:
-
-            column_key = column.upper()
-
-
-            if column_key in biomarker_lookup:
-
-                actual_column = (
-                    biomarker_lookup[
-                        column_key
-                    ]
-                )
-
-
-                value = pd.to_numeric(
-                    patient[actual_column],
-                    errors="coerce"
-                )
-
-
-                if pd.isna(value):
-
-                    biomarkers[column] = None
-
-                else:
-
-                    biomarkers[column] = round(
-                        float(value),
-                        4
-                    )
-
-            else:
-
-                biomarkers[column] = None
-
-
-        # ----------------------------------------------------
-        # RUN GNN
-        # ----------------------------------------------------
-
-        prediction_result = (
-            run_gnn_prediction(
-                gene_values
-            )
-        )
-
-
-        # ----------------------------------------------------
-        # TOP GENE SIGNALS
-        # ----------------------------------------------------
-
-        important_features = (
-            get_top_gene_signals(
-                gene_values
-            )
-        )
-
-
-        # ----------------------------------------------------
-        # OPTIONAL DIAGNOSIS
-        #
-        # ONLY returned for testing.
-        # NEVER used for prediction.
-        # ----------------------------------------------------
-
-        provided_diagnosis = None
-
-
-        diagnosis_lookup = {
-
-            str(column)
-            .strip()
-            .upper():
-
-            column
-
-            for column
-            in df.columns
-
-        }
-
-
-        if "DIAGNOSIS" in diagnosis_lookup:
-
-            diagnosis_column = (
-                diagnosis_lookup[
-                    "DIAGNOSIS"
-                ]
-            )
-
-
-            diagnosis_value = patient[
-                diagnosis_column
-            ]
-
-
-            if not pd.isna(
-                diagnosis_value
-            ):
-
-                provided_diagnosis = str(
-                    diagnosis_value
-                ).strip()
-
-
-        # ----------------------------------------------------
-        # RETURN RESULT
-        # ----------------------------------------------------
-
-        return {
-
-            "status":
-                "success",
-
-            "dataset_type":
-                "patient",
-
-            "patient": {
-
-                "patient_id":
-                    patient_id,
-
-                "sample_type":
-                    sample_type
-
-            },
-
-            "biomarkers":
-                biomarkers,
-
-            "prediction": {
-
-                "class":
-                    prediction_result[
-                        "prediction"
-                    ],
-
-                "class_name":
-                    CLASS_DESCRIPTIONS[
-                        prediction_result[
-                            "prediction"
-                        ]
-                    ],
-
-                "confidence":
-                    prediction_result[
-                        "confidence"
-                    ],
-
-                "probabilities":
-                    prediction_result[
-                        "probabilities"
-                    ]
-
-            },
-
-            "important_features":
-                important_features,
-
-            "model": {
-
-                "name":
-                    "Weighted Improved GCN",
-
-                "selected_genes":
-                    len(selected_genes),
-
-                "graph_type":
-                    "k-NN",
-
-                "k":
-                    10,
-
-                "graph_edges":
-                    int(edge_index.shape[1])
-
-            },
-
-            "data_validation": {
-
-                "required_gene_count":
-                    len(selected_genes),
-
-                "provided_gene_count":
-                    len(gene_column_map),
-
-                "missing_gene_count":
-                    len(missing_genes),
-
-                "gene_data_complete":
-                    len(missing_genes) == 0
-
-            },
-
-            "provided_diagnosis":
-                provided_diagnosis,
-
-            "clinical_note":
-                (
-                    "This is a research prototype prediction "
-                    "and must not be interpreted as a clinical "
-                    "diagnosis."
-                )
 
         }
 
