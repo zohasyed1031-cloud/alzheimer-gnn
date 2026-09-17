@@ -9,7 +9,6 @@ import pandas as pd
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import gc
 
 from torch_geometric.nn import (
     GCNConv,
@@ -25,7 +24,7 @@ from torch_geometric.nn import (
 app = FastAPI(
     title="Alzheimer GNN Analysis API",
     description="Research prototype for Alzheimer's classification using gene expression.",
-    version="2.1.0"
+    version="2.2.0"
 )
 
 app.add_middleware(
@@ -52,7 +51,10 @@ MODEL_DIR = BASE_DIR / "model"
 device = torch.device(
     "cuda" if torch.cuda.is_available() else "cpu"
 )
+
+# Reduce CPU memory/thread usage on Render
 torch.set_num_threads(1)
+
 
 # ============================================================
 # LOAD MODEL FILES
@@ -98,7 +100,6 @@ edge_index = torch.load(
     map_location=device,
     weights_only=True
 )
-
 
 edge_weight = torch.load(
     MODEL_DIR / "edge_weight.pt",
@@ -235,7 +236,8 @@ def root():
 
     return {
 
-        "status": "running",
+        "status":
+            "running",
 
         "model":
             "Weighted Improved GCN",
@@ -278,7 +280,7 @@ def clean_columns(df):
 
 # ============================================================
 # HELPER:
-# CREATE CASE-INSENSITIVE GENE MAP
+# CREATE CASE-INSENSITIVE COLUMN MAP
 # ============================================================
 
 def create_gene_column_map(df):
@@ -341,6 +343,26 @@ def check_patient_genes(df):
 
 # ============================================================
 # HELPER:
+# FIND COLUMN CASE-INSENSITIVELY
+# ============================================================
+
+def find_column(df, possible_names):
+
+    column_lookup = create_gene_column_map(df)
+
+    for name in possible_names:
+
+        key = str(name).strip().upper()
+
+        if key in column_lookup:
+
+            return column_lookup[key]
+
+    return None
+
+
+# ============================================================
+# HELPER:
 # RUN GNN FOR ONE SAMPLE
 # ============================================================
 
@@ -360,7 +382,7 @@ def run_gnn_prediction(sample_values):
     )
 
 
-    # SAME scaler used during training
+    # Same scaler used during training
     sample_scaled = scaler.transform(
         sample_df
     )
@@ -410,20 +432,23 @@ def run_gnn_prediction(sample_values):
 
     probability_values = {
 
-        "AD": round(
-            probabilities[0].item() * 100,
-            2
-        ),
+        "AD":
+            round(
+                probabilities[0].item() * 100,
+                2
+            ),
 
-        "CTL": round(
-            probabilities[1].item() * 100,
-            2
-        ),
+        "CTL":
+            round(
+                probabilities[1].item() * 100,
+                2
+            ),
 
-        "MCI": round(
-            probabilities[2].item() * 100,
-            2
-        )
+        "MCI":
+            round(
+                probabilities[2].item() * 100,
+                2
+            )
 
     }
 
@@ -517,6 +542,579 @@ def get_top_gene_signals(sample_values):
 
 
 # ============================================================
+# PATIENT CSV PREDICTION
+#
+# Expected:
+#
+# Patient_ID | Sample_Type | 1000 genes | biomarkers...
+#
+# Biomarkers are optional.
+# Missing biomarkers return null so the frontend
+# can display them as N/A.
+# ============================================================
+
+@app.post("/patient-predict")
+async def patient_predict(
+    file: UploadFile = File(...)
+):
+
+    try:
+
+        # ----------------------------------------------------
+        # READ PATIENT CSV
+        # ----------------------------------------------------
+
+        contents = await file.read()
+
+        if not contents:
+
+            raise HTTPException(
+                status_code=400,
+                detail="Uploaded patient CSV is empty."
+            )
+
+
+        df = pd.read_csv(
+            io.BytesIO(contents)
+        )
+
+
+        df = clean_columns(
+            df
+        )
+
+
+        if df.empty:
+
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "Patient CSV does not contain "
+                    "any data rows."
+                )
+            )
+
+
+        # ----------------------------------------------------
+        # USE FIRST ROW
+        # ----------------------------------------------------
+
+        patient_row = df.iloc[0]
+
+
+        # ----------------------------------------------------
+        # CHECK REQUIRED GENES
+        # ----------------------------------------------------
+
+        missing_genes, gene_column_map = (
+            check_patient_genes(df)
+        )
+
+
+        if missing_genes:
+
+            raise HTTPException(
+                status_code=400,
+                detail={
+
+                    "message": (
+                        "Patient CSV is missing "
+                        "required gene columns."
+                    ),
+
+                    "missing_count":
+                        len(missing_genes),
+
+                    "required_genes":
+                        len(selected_genes),
+
+                    "example_missing_genes":
+                        missing_genes[:30]
+
+                }
+            )
+
+
+        # ----------------------------------------------------
+        # EXTRACT GENE VALUES
+        # ----------------------------------------------------
+
+        sample_values = []
+
+        invalid_genes = []
+
+
+        for gene in selected_genes:
+
+            column_name = gene_column_map[
+                gene
+            ]
+
+
+            value = pd.to_numeric(
+                patient_row[column_name],
+                errors="coerce"
+            )
+
+
+            if pd.isna(value):
+
+                invalid_genes.append(
+                    gene
+                )
+
+            else:
+
+                sample_values.append(
+                    float(value)
+                )
+
+
+        if invalid_genes:
+
+            raise HTTPException(
+                status_code=400,
+                detail={
+
+                    "message": (
+                        "Patient CSV contains "
+                        "missing or non-numeric "
+                        "gene values."
+                    ),
+
+                    "invalid_count":
+                        len(invalid_genes),
+
+                    "example_invalid_genes":
+                        invalid_genes[:30]
+
+                }
+            )
+
+
+        # ----------------------------------------------------
+        # PATIENT ID
+        # ----------------------------------------------------
+
+        patient_id_column = find_column(
+            df,
+            [
+                "Patient_ID",
+                "Patient ID",
+                "PatientID",
+                "ID"
+            ]
+        )
+
+
+        if patient_id_column is not None:
+
+            patient_id_value = (
+                patient_row[
+                    patient_id_column
+                ]
+            )
+
+            if pd.isna(
+                patient_id_value
+            ):
+
+                patient_id = "Unknown"
+
+            else:
+
+                patient_id = str(
+                    patient_id_value
+                )
+
+        else:
+
+            patient_id = "Unknown"
+
+
+        # ----------------------------------------------------
+        # SAMPLE TYPE
+        # ----------------------------------------------------
+
+        sample_type_column = find_column(
+            df,
+            [
+                "Sample_Type",
+                "Sample Type",
+                "SampleType",
+                "Tissue",
+                "Tissue_Type"
+            ]
+        )
+
+
+        if sample_type_column is not None:
+
+            sample_type_value = (
+                patient_row[
+                    sample_type_column
+                ]
+            )
+
+            if pd.isna(
+                sample_type_value
+            ):
+
+                sample_type = "Unknown"
+
+            else:
+
+                sample_type = str(
+                    sample_type_value
+                )
+
+        else:
+
+            sample_type = "Unknown"
+
+
+        # ----------------------------------------------------
+        # BIOMARKER ANALYSIS
+        # ----------------------------------------------------
+
+        column_lookup = (
+            create_gene_column_map(df)
+        )
+
+
+        biomarkers = {}
+
+
+        biomarker_aliases = {
+
+            "AB42": [
+                "AB42",
+                "Aβ42",
+                "Aβ-42",
+                "Amyloid_Beta_42",
+                "Amyloid Beta 42",
+                "AmyloidBeta42"
+            ],
+
+            "AB40": [
+                "AB40",
+                "Aβ40",
+                "Aβ-40",
+                "Amyloid_Beta_40",
+                "Amyloid Beta 40",
+                "AmyloidBeta40"
+            ],
+
+            "pTau181": [
+                "pTau181",
+                "p-tau181",
+                "p_tau181",
+                "PTAU181",
+                "pTau-181"
+            ],
+
+            "pTau217": [
+                "pTau217",
+                "p-tau217",
+                "p_tau217",
+                "PTAU217",
+                "pTau-217"
+            ],
+
+            "AB42_AB40_Ratio": [
+                "AB42_AB40_Ratio",
+                "AB42/AB40",
+                "Aβ42/Aβ40",
+                "Amyloid_Beta_Ratio",
+                "Amyloid Beta Ratio"
+            ]
+
+        }
+
+
+        for biomarker in BIOMARKER_COLUMNS:
+
+            matching_column = None
+
+
+            for alias in biomarker_aliases[
+                biomarker
+            ]:
+
+                alias_key = (
+                    str(alias)
+                    .strip()
+                    .upper()
+                )
+
+
+                if alias_key in column_lookup:
+
+                    matching_column = (
+                        column_lookup[
+                            alias_key
+                        ]
+                    )
+
+                    break
+
+
+            if matching_column is None:
+
+                biomarkers[
+                    biomarker
+                ] = None
+
+            else:
+
+                value = pd.to_numeric(
+                    patient_row[
+                        matching_column
+                    ],
+                    errors="coerce"
+                )
+
+
+                if pd.isna(value):
+
+                    biomarkers[
+                        biomarker
+                    ] = None
+
+                else:
+
+                    biomarkers[
+                        biomarker
+                    ] = round(
+                        float(value),
+                        4
+                    )
+
+
+        # ----------------------------------------------------
+        # CALCULATE RATIO IF NOT PROVIDED
+        # ----------------------------------------------------
+
+        if (
+            biomarkers[
+                "AB42_AB40_Ratio"
+            ] is None
+
+            and biomarkers[
+                "AB42"
+            ] is not None
+
+            and biomarkers[
+                "AB40"
+            ] is not None
+
+            and biomarkers[
+                "AB40"
+            ] != 0
+        ):
+
+            biomarkers[
+                "AB42_AB40_Ratio"
+            ] = round(
+                biomarkers["AB42"]
+                /
+                biomarkers["AB40"],
+                4
+            )
+
+
+        # ----------------------------------------------------
+        # RUN GNN
+        # ----------------------------------------------------
+
+        prediction_result = (
+            run_gnn_prediction(
+                sample_values
+            )
+        )
+
+
+        # ----------------------------------------------------
+        # IMPORTANT GENE SIGNALS
+        # ----------------------------------------------------
+
+        important_features = (
+            get_top_gene_signals(
+                sample_values
+            )
+        )
+
+
+        # ----------------------------------------------------
+        # OPTIONAL PROVIDED DIAGNOSIS
+        # ----------------------------------------------------
+
+        diagnosis_column = find_column(
+            df,
+            [
+                "Diagnosis",
+                "Label",
+                "Class",
+                "Diagnosis_Label"
+            ]
+        )
+
+
+        provided_diagnosis = None
+
+
+        if diagnosis_column is not None:
+
+            diagnosis_value = (
+                patient_row[
+                    diagnosis_column
+                ]
+            )
+
+
+            if not pd.isna(
+                diagnosis_value
+            ):
+
+                provided_diagnosis = str(
+                    diagnosis_value
+                )
+
+
+        # ----------------------------------------------------
+        # DATA VALIDATION
+        # ----------------------------------------------------
+
+        validation = {
+
+            "required_gene_count":
+                len(selected_genes),
+
+            "provided_gene_count":
+                len(selected_genes),
+
+            "missing_gene_count":
+                0,
+
+            "invalid_gene_count":
+                len(invalid_genes),
+
+            "biomarkers_available":
+                sum(
+                    value is not None
+                    for value
+                    in biomarkers.values()
+                )
+
+        }
+
+
+        # ----------------------------------------------------
+        # CLINICAL NOTE
+        # ----------------------------------------------------
+
+        clinical_note = (
+            "This result is generated by a research "
+            "prototype using gene-expression data and "
+            "should not be interpreted as a clinical diagnosis."
+        )
+
+
+        # ----------------------------------------------------
+        # RETURN
+        # ----------------------------------------------------
+
+        return {
+
+            "status":
+                "success",
+
+            "patient": {
+
+                "patient_id":
+                    patient_id,
+
+                "sample_type":
+                    sample_type
+
+            },
+
+            "biomarkers":
+                biomarkers,
+
+            "prediction": {
+
+                "class":
+                    prediction_result[
+                        "prediction"
+                    ],
+
+                "description":
+                    CLASS_DESCRIPTIONS[
+                        prediction_result[
+                            "prediction"
+                        ]
+                    ],
+
+                "confidence":
+                    prediction_result[
+                        "confidence"
+                    ],
+
+                "probabilities":
+                    prediction_result[
+                        "probabilities"
+                    ]
+
+            },
+
+            "important_features":
+                important_features,
+
+            "model": {
+
+                "name":
+                    "Weighted Improved GCN",
+
+                "selected_genes":
+                    len(selected_genes),
+
+                "graph_edges":
+                    int(
+                        edge_index.shape[1]
+                    ),
+
+                "device":
+                    str(device)
+
+            },
+
+            "data_validation":
+                validation,
+
+            "provided_diagnosis":
+                provided_diagnosis,
+
+            "clinical_note":
+                clinical_note
+
+        }
+
+
+    except HTTPException:
+
+        raise
+
+
+    except Exception as e:
+
+        raise HTTPException(
+            status_code=500,
+            detail=str(e)
+        )
+
+
+# ============================================================
 # RESEARCH DATASET PREDICTION - MEMORY OPTIMIZED
 #
 # Expected:
@@ -540,15 +1138,18 @@ async def predict(
 
         uploaded_file = file.file
 
+
         # Read only the header first
         header_df = pd.read_csv(
             uploaded_file,
             nrows=0
         )
 
+
         header_df = clean_columns(
             header_df
         )
+
 
         if "Gene_Symbol" not in header_df.columns:
 
@@ -560,11 +1161,18 @@ async def predict(
                 )
             )
 
+
         sample_columns = [
+
             column
-            for column in header_df.columns
+
+            for column
+            in header_df.columns
+
             if column != "Gene_Symbol"
+
         ]
+
 
         if len(sample_columns) == 0:
 
@@ -576,38 +1184,46 @@ async def predict(
                 )
             )
 
+
         # ----------------------------------------------------
         # READ DATA WITH FLOAT32
-        #
-        # float64 = 8 bytes/value
-        # float32 = 4 bytes/value
-        #
-        # This roughly halves expression-data memory.
         # ----------------------------------------------------
 
         uploaded_file.seek(0)
 
+
         dtype_map = {
-            column: np.float32
-            for column in sample_columns
+
+            column:
+                np.float32
+
+            for column
+            in sample_columns
+
         }
+
 
         df = pd.read_csv(
             uploaded_file,
             dtype=dtype_map
         )
 
+
         df = clean_columns(
             df
         )
+
 
         # ----------------------------------------------------
         # REMOVE DUPLICATE GENES
         # ----------------------------------------------------
 
         df = df.drop_duplicates(
-            subset=["Gene_Symbol"]
+            subset=[
+                "Gene_Symbol"
+            ]
         )
+
 
         df["Gene_Symbol"] = (
             df["Gene_Symbol"]
@@ -615,9 +1231,11 @@ async def predict(
             .str.strip()
         )
 
+
         df = df.set_index(
             "Gene_Symbol"
         )
+
 
         # ----------------------------------------------------
         # CHECK REQUIRED GENES
@@ -627,11 +1245,13 @@ async def predict(
 
             gene
 
-            for gene in selected_genes
+            for gene
+            in selected_genes
 
             if gene not in df.index
 
         ]
+
 
         if missing_genes:
 
@@ -656,6 +1276,7 @@ async def predict(
                 }
             )
 
+
         # ----------------------------------------------------
         # SELECT ONLY THE 1000 GENES NEEDED BY THE GNN
         # ----------------------------------------------------
@@ -664,11 +1285,9 @@ async def predict(
             selected_genes
         ]
 
+
         # ----------------------------------------------------
-        # CHECK FOR MISSING / NON-NUMERIC VALUES
-        #
-        # Because expression columns were read as float32,
-        # invalid values become NaN.
+        # CHECK MISSING / NON-NUMERIC VALUES
         # ----------------------------------------------------
 
         if expression.isna().any().any():
@@ -677,9 +1296,11 @@ async def predict(
                 expression.isna().any()
             ]
 
+
             bad_sample = str(
                 bad_columns[0]
             )
+
 
             raise HTTPException(
                 status_code=400,
@@ -689,24 +1310,32 @@ async def predict(
                 )
             )
 
+
         # ----------------------------------------------------
         # RUN GNN
         # ----------------------------------------------------
 
         results = []
 
+
         for sample_id in expression.columns:
 
             sample_values = (
-                expression[sample_id]
-                .to_numpy(dtype=np.float32)
+                expression[
+                    sample_id
+                ]
+                .to_numpy(
+                    dtype=np.float32
+                )
             )
+
 
             prediction_result = (
                 run_gnn_prediction(
                     sample_values
                 )
             )
+
 
             results.append({
 
@@ -730,6 +1359,7 @@ async def predict(
 
             })
 
+
         # ----------------------------------------------------
         # DATASET BASIC INFORMATION
         # ----------------------------------------------------
@@ -738,15 +1368,14 @@ async def predict(
             df.index
         )
 
+
         number_of_samples = len(
             df.columns
         )
 
+
         # ----------------------------------------------------
         # DATASET STATISTICS
-        #
-        # Work directly on the original float32 dataframe.
-        # Do NOT create another numeric_df copy.
         # ----------------------------------------------------
 
         missing_values = int(
@@ -755,10 +1384,13 @@ async def predict(
             .sum()
         )
 
+
         mean_expression = float(
-            df.to_numpy(dtype=np.float32)
-            .mean()
+            df.to_numpy(
+                dtype=np.float32
+            ).mean()
         )
+
 
         # ----------------------------------------------------
         # TOP VARIABLE GENES
@@ -769,10 +1401,12 @@ async def predict(
             ddof=1
         )
 
+
         top_variable_genes_series = (
             gene_variances
             .nlargest(10)
         )
+
 
         top_variable_genes = [
 
@@ -794,23 +1428,27 @@ async def predict(
 
         ]
 
+
         # ----------------------------------------------------
         # EXPRESSION OVERVIEW
-        #
-        # Only take the first sample and first 30 genes.
         # ----------------------------------------------------
 
         expression_overview = []
 
+
         if number_of_samples > 0:
 
-            first_sample = df.iloc[:, 0]
+            first_sample = (
+                df.iloc[:, 0]
+            )
+
 
             overview_genes = (
                 first_sample
                 .dropna()
                 .head(30)
             )
+
 
             expression_overview = [
 
@@ -832,16 +1470,18 @@ async def predict(
 
             ]
 
+
         # ----------------------------------------------------
-        # FREE LARGE OBJECTS BEFORE RETURNING
+        # FREE LARGE OBJECTS
         # ----------------------------------------------------
 
         del df
         del expression
         del gene_variances
 
+
         # ----------------------------------------------------
-        # RETURN RESULT
+        # RETURN
         # ----------------------------------------------------
 
         return {
@@ -883,7 +1523,9 @@ async def predict(
                 len(selected_genes),
 
             "graph_edges":
-                int(edge_index.shape[1]),
+                int(
+                    edge_index.shape[1]
+                ),
 
             "k_value":
                 10,
