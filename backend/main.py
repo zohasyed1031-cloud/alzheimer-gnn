@@ -1,8 +1,25 @@
+# ============================================================
+# MEMORY OPTIMIZATION - MUST BE BEFORE NUMPY / TORCH
+# ============================================================
+
+import os
+
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+os.environ["OPENBLAS_NUM_THREADS"] = "1"
+os.environ["NUMEXPR_NUM_THREADS"] = "1"
+
+
+# ============================================================
+# IMPORTS
+# ============================================================
+
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
 from pathlib import Path
 import io
+import gc
 import joblib
 import numpy as np
 import pandas as pd
@@ -24,7 +41,7 @@ from torch_geometric.nn import (
 app = FastAPI(
     title="Alzheimer GNN Analysis API",
     description="Research prototype for Alzheimer's classification using gene expression.",
-    version="2.2.0"
+    version="2.3.0"
 )
 
 app.add_middleware(
@@ -55,61 +72,80 @@ device = torch.device(
 # Reduce CPU memory/thread usage on Render
 torch.set_num_threads(1)
 
+try:
+    torch.set_num_interop_threads(1)
+except RuntimeError:
+    # PyTorch may already have initialized inter-op threads
+    pass
+
 
 # ============================================================
-# LOAD MODEL FILES
+# LOAD SELECTED GENES
 # ============================================================
 
 selected_genes_df = pd.read_csv(
-    MODEL_DIR / "selected_genes_1000.csv"
+    MODEL_DIR / "selected_genes_1000.csv",
+    usecols=["Gene_Symbol"]
 )
 
-selected_genes_df.columns = (
-    selected_genes_df.columns
-    .astype(str)
-    .str.strip()
-)
-
-if "Gene_Symbol" not in selected_genes_df.columns:
-    raise RuntimeError(
-        "selected_genes_1000.csv must contain a 'Gene_Symbol' column."
-    )
-
-
-selected_genes = (
+selected_genes_df["Gene_Symbol"] = (
     selected_genes_df["Gene_Symbol"]
     .astype(str)
     .str.strip()
-    .tolist()
 )
 
-
-# Remove accidental duplicate selected genes
 selected_genes = list(
-    dict.fromkeys(selected_genes)
+    dict.fromkeys(
+        selected_genes_df["Gene_Symbol"].tolist()
+    )
 )
 
+del selected_genes_df
+
+gc.collect()
+
+
+if len(selected_genes) == 0:
+    raise RuntimeError(
+        "No selected genes were found in selected_genes_1000.csv."
+    )
+
+
+# ============================================================
+# LOAD SCALER
+# ============================================================
 
 scaler = joblib.load(
     MODEL_DIR / "scaler.pkl"
 )
 
 
+# ============================================================
+# LOAD GRAPH
+# ============================================================
+
 edge_index = torch.load(
     MODEL_DIR / "edge_index.pt",
-    map_location=device,
+    map_location="cpu",
     weights_only=True
 )
 
 edge_weight = torch.load(
     MODEL_DIR / "edge_weight.pt",
-    map_location=device,
+    map_location="cpu",
     weights_only=True
 )
 
+# Keep graph tensors on CPU for the CPU deployment
+edge_index = edge_index.to(
+    device=device,
+    dtype=torch.long
+)
 
-edge_index = edge_index.to(device)
-edge_weight = edge_weight.to(device)
+edge_weight = edge_weight.to(
+    device=device,
+    dtype=torch.float32
+)
 
 
 # ============================================================
@@ -122,13 +158,24 @@ class AlzheimerGCNWeighted(nn.Module):
 
         super().__init__()
 
-        self.conv1 = GCNConv(1, 64)
+        self.conv1 = GCNConv(
+            1,
+            64
+        )
 
-        self.conv2 = GCNConv(64, 64)
+        self.conv2 = GCNConv(
+            64,
+            64
+        )
 
-        self.dropout = nn.Dropout(0.3)
+        self.dropout = nn.Dropout(
+            0.3
+        )
 
-        self.fc = nn.Linear(128, 3)
+        self.fc = nn.Linear(
+            128,
+            3
+        )
 
 
     def forward(
@@ -145,9 +192,14 @@ class AlzheimerGCNWeighted(nn.Module):
             edge_weight=edge_weight
         )
 
-        x = F.relu(x)
+        x = F.relu(
+            x
+        )
 
-        x = self.dropout(x)
+        # Dropout is inactive because model.eval()
+        x = self.dropout(
+            x
+        )
 
         x = self.conv2(
             x,
@@ -155,7 +207,9 @@ class AlzheimerGCNWeighted(nn.Module):
             edge_weight=edge_weight
         )
 
-        x = F.relu(x)
+        x = F.relu(
+            x
+        )
 
         mean_pool = global_mean_pool(
             x,
@@ -168,11 +222,16 @@ class AlzheimerGCNWeighted(nn.Module):
         )
 
         x = torch.cat(
-            [mean_pool, max_pool],
+            [
+                mean_pool,
+                max_pool
+            ],
             dim=1
         )
 
-        x = self.fc(x)
+        x = self.fc(
+            x
+        )
 
         return x
 
@@ -181,8 +240,9 @@ class AlzheimerGCNWeighted(nn.Module):
 # LOAD TRAINED MODEL
 # ============================================================
 
-model = AlzheimerGCNWeighted().to(device)
-
+model = AlzheimerGCNWeighted().to(
+    device
+)
 
 model.load_state_dict(
     torch.load(
@@ -192,8 +252,12 @@ model.load_state_dict(
     )
 )
 
-
 model.eval()
+
+
+# Make sure parameters do not require gradients
+for parameter in model.parameters():
+    parameter.requires_grad_(False)
 
 
 # ============================================================
@@ -267,8 +331,6 @@ def root():
 
 def clean_columns(df):
 
-    df = df.copy()
-
     df.columns = (
         df.columns
         .astype(str)
@@ -309,7 +371,9 @@ def create_gene_column_map(df):
 
 def check_patient_genes(df):
 
-    column_lookup = create_gene_column_map(df)
+    column_lookup = create_gene_column_map(
+        df
+    )
 
     missing_genes = []
 
@@ -327,7 +391,9 @@ def check_patient_genes(df):
 
             gene_column_map[
                 gene_clean
-            ] = column_lookup[gene_key]
+            ] = column_lookup[
+                gene_key
+            ]
 
         else:
 
@@ -346,17 +412,28 @@ def check_patient_genes(df):
 # FIND COLUMN CASE-INSENSITIVELY
 # ============================================================
 
-def find_column(df, possible_names):
+def find_column(
+    df,
+    possible_names
+):
 
-    column_lookup = create_gene_column_map(df)
+    column_lookup = create_gene_column_map(
+        df
+    )
 
     for name in possible_names:
 
-        key = str(name).strip().upper()
+        key = (
+            str(name)
+            .strip()
+            .upper()
+        )
 
         if key in column_lookup:
 
-            return column_lookup[key]
+            return column_lookup[
+                key
+            ]
 
     return None
 
@@ -364,11 +441,17 @@ def find_column(df, possible_names):
 # ============================================================
 # HELPER:
 # RUN GNN FOR ONE SAMPLE
+#
+# MEMORY OPTIMIZED
 # ============================================================
 
-def run_gnn_prediction(sample_values):
+def run_gnn_prediction(
+    sample_values
+):
 
-    if len(sample_values) != len(selected_genes):
+    if len(sample_values) != len(
+        selected_genes
+    ):
 
         raise ValueError(
             f"Expected {len(selected_genes)} gene values, "
@@ -376,27 +459,54 @@ def run_gnn_prediction(sample_values):
         )
 
 
-    sample_df = pd.DataFrame(
-        [sample_values],
-        columns=selected_genes
+    # --------------------------------------------------------
+    # Convert directly to NumPy float32
+    # No Pandas DataFrame required
+    # --------------------------------------------------------
+
+    sample_array = np.asarray(
+        sample_values,
+        dtype=np.float32
+    ).reshape(
+        1,
+        -1
     )
 
 
-    # Same scaler used during training
+    # --------------------------------------------------------
+    # Apply the same scaler used during training
+    # --------------------------------------------------------
+
     sample_scaled = scaler.transform(
-        sample_df
+        sample_array
     )
 
 
+    # Ensure float32 without unnecessary copy
+    sample_scaled = np.asarray(
+        sample_scaled,
+        dtype=np.float32
+    )
+
+
+    # --------------------------------------------------------
     # Convert to graph node features
-    x = torch.tensor(
-        sample_scaled[0],
-        dtype=torch.float32,
-        device=device
-    ).view(-1, 1)
+    # --------------------------------------------------------
+
+    x = torch.from_numpy(
+        sample_scaled[0]
+    ).view(
+        -1,
+        1
+    ).to(
+        device
+    )
 
 
+    # --------------------------------------------------------
     # One graph = one batch
+    # --------------------------------------------------------
+
     batch = torch.zeros(
         x.size(0),
         dtype=torch.long,
@@ -404,7 +514,13 @@ def run_gnn_prediction(sample_values):
     )
 
 
-    with torch.no_grad():
+    # --------------------------------------------------------
+    # INFERENCE
+    #
+    # inference_mode uses less overhead than no_grad
+    # --------------------------------------------------------
+
+    with torch.inference_mode():
 
         output = model(
             x,
@@ -413,49 +529,71 @@ def run_gnn_prediction(sample_values):
             batch
         )
 
-
         probabilities = torch.softmax(
             output,
             dim=1
         )[0]
 
+        predicted_class = int(
+            torch.argmax(
+                probabilities
+            ).item()
+        )
 
-        predicted_class = torch.argmax(
-            probabilities
-        ).item()
+        probability_values = {
 
+            "AD":
+                round(
+                    float(
+                        probabilities[0]
+                    ) * 100,
+                    2
+                ),
+
+            "CTL":
+                round(
+                    float(
+                        probabilities[1]
+                    ) * 100,
+                    2
+                ),
+
+            "MCI":
+                round(
+                    float(
+                        probabilities[2]
+                    ) * 100,
+                    2
+                )
+
+        }
+
+
+    # --------------------------------------------------------
+    # Convert result before deleting tensors
+    # --------------------------------------------------------
 
     prediction = CLASS_NAMES[
         predicted_class
     ]
 
-
-    probability_values = {
-
-        "AD":
-            round(
-                probabilities[0].item() * 100,
-                2
-            ),
-
-        "CTL":
-            round(
-                probabilities[1].item() * 100,
-                2
-            ),
-
-        "MCI":
-            round(
-                probabilities[2].item() * 100,
-                2
-            )
-
-    }
-
-
     confidence = probability_values[
         prediction
     ]
+
+
+    # --------------------------------------------------------
+    # Release temporary objects
+    # --------------------------------------------------------
+
+    del x
+    del batch
+    del output
+    del probabilities
+    del sample_array
+    del sample_scaled
+
+    gc.collect()
 
 
     return {
@@ -475,70 +613,93 @@ def run_gnn_prediction(sample_values):
 # ============================================================
 # HELPER:
 # TOP GENE SIGNALS
+#
+# MEMORY OPTIMIZED
 # ============================================================
 
-def get_top_gene_signals(sample_values):
+def get_top_gene_signals(
+    sample_values
+):
 
-    sample_df = pd.DataFrame(
-        [sample_values],
-        columns=selected_genes
+    sample_array = np.asarray(
+        sample_values,
+        dtype=np.float32
+    ).reshape(
+        1,
+        -1
     )
 
 
+    # Apply training scaler
     scaled_values = scaler.transform(
-        sample_df
+        sample_array
     )[0]
 
 
-    signal_df = pd.DataFrame({
-
-        "gene":
-            selected_genes,
-
-        "signal":
-            np.abs(scaled_values),
-
-        "value":
-            sample_values
-
-    })
-
-
-    signal_df = (
-        signal_df
-        .sort_values(
-            "signal",
-            ascending=False
-        )
-        .head(10)
+    scaled_values = np.asarray(
+        scaled_values,
+        dtype=np.float32
     )
 
 
-    return [
+    signals = np.abs(
+        scaled_values
+    )
 
-        {
+
+    # --------------------------------------------------------
+    # Get indices of top 10 signals
+    # --------------------------------------------------------
+
+    top_indices = np.argsort(
+        signals
+    )[-10:][::-1]
+
+
+    results = []
+
+
+    for index in top_indices:
+
+        results.append({
 
             "gene":
-                str(row["gene"]),
+                str(
+                    selected_genes[index]
+                ),
 
             "signal":
                 round(
-                    float(row["signal"]),
+                    float(
+                        signals[index]
+                    ),
                     4
                 ),
 
             "expression":
                 round(
-                    float(row["value"]),
+                    float(
+                        sample_values[index]
+                    ),
                     4
                 )
 
-        }
+        })
 
-        for _, row
-        in signal_df.iterrows()
 
-    ]
+    # --------------------------------------------------------
+    # Free temporary arrays
+    # --------------------------------------------------------
+
+    del sample_array
+    del scaled_values
+    del signals
+    del top_indices
+
+    gc.collect()
+
+
+    return results
 
 
 # ============================================================
@@ -549,8 +710,6 @@ def get_top_gene_signals(sample_values):
 # Patient_ID | Sample_Type | 1000 genes | biomarkers...
 #
 # Biomarkers are optional.
-# Missing biomarkers return null so the frontend
-# can display them as N/A.
 # ============================================================
 
 @app.post("/patient-predict")
@@ -560,9 +719,9 @@ async def patient_predict(
 
     try:
 
-        # ----------------------------------------------------
+        # ====================================================
         # READ PATIENT CSV
-        # ----------------------------------------------------
+        # ====================================================
 
         contents = await file.read()
 
@@ -570,14 +729,21 @@ async def patient_predict(
 
             raise HTTPException(
                 status_code=400,
-                detail="Uploaded patient CSV is empty."
+                detail=(
+                    "Uploaded patient CSV "
+                    "is empty."
+                )
             )
 
 
         df = pd.read_csv(
-            io.BytesIO(contents)
+            io.BytesIO(
+                contents
+            )
         )
 
+
+        del contents
 
         df = clean_columns(
             df
@@ -595,19 +761,22 @@ async def patient_predict(
             )
 
 
-        # ----------------------------------------------------
+        # ====================================================
         # USE FIRST ROW
-        # ----------------------------------------------------
+        # ====================================================
 
         patient_row = df.iloc[0]
 
 
-        # ----------------------------------------------------
+        # ====================================================
         # CHECK REQUIRED GENES
-        # ----------------------------------------------------
+        # ====================================================
 
-        missing_genes, gene_column_map = (
-            check_patient_genes(df)
+        (
+            missing_genes,
+            gene_column_map
+        ) = check_patient_genes(
+            df
         )
 
 
@@ -623,10 +792,14 @@ async def patient_predict(
                     ),
 
                     "missing_count":
-                        len(missing_genes),
+                        len(
+                            missing_genes
+                        ),
 
                     "required_genes":
-                        len(selected_genes),
+                        len(
+                            selected_genes
+                        ),
 
                     "example_missing_genes":
                         missing_genes[:30]
@@ -635,9 +808,9 @@ async def patient_predict(
             )
 
 
-        # ----------------------------------------------------
+        # ====================================================
         # EXTRACT GENE VALUES
-        # ----------------------------------------------------
+        # ====================================================
 
         sample_values = []
 
@@ -650,14 +823,17 @@ async def patient_predict(
                 gene
             ]
 
-
             value = pd.to_numeric(
-                patient_row[column_name],
+                patient_row[
+                    column_name
+                ],
                 errors="coerce"
             )
 
 
-            if pd.isna(value):
+            if pd.isna(
+                value
+            ):
 
                 invalid_genes.append(
                     gene
@@ -666,7 +842,9 @@ async def patient_predict(
             else:
 
                 sample_values.append(
-                    float(value)
+                    float(
+                        value
+                    )
                 )
 
 
@@ -683,7 +861,9 @@ async def patient_predict(
                     ),
 
                     "invalid_count":
-                        len(invalid_genes),
+                        len(
+                            invalid_genes
+                        ),
 
                     "example_invalid_genes":
                         invalid_genes[:30]
@@ -692,9 +872,9 @@ async def patient_predict(
             )
 
 
-        # ----------------------------------------------------
+        # ====================================================
         # PATIENT ID
-        # ----------------------------------------------------
+        # ====================================================
 
         patient_id_column = find_column(
             df,
@@ -732,9 +912,9 @@ async def patient_predict(
             patient_id = "Unknown"
 
 
-        # ----------------------------------------------------
+        # ====================================================
         # SAMPLE TYPE
-        # ----------------------------------------------------
+        # ====================================================
 
         sample_type_column = find_column(
             df,
@@ -773,12 +953,14 @@ async def patient_predict(
             sample_type = "Unknown"
 
 
-        # ----------------------------------------------------
+        # ====================================================
         # BIOMARKER ANALYSIS
-        # ----------------------------------------------------
+        # ====================================================
 
         column_lookup = (
-            create_gene_column_map(df)
+            create_gene_column_map(
+                df
+            )
         )
 
 
@@ -788,45 +970,55 @@ async def patient_predict(
         biomarker_aliases = {
 
             "AB42": [
+
                 "AB42",
                 "Aβ42",
                 "Aβ-42",
                 "Amyloid_Beta_42",
                 "Amyloid Beta 42",
                 "AmyloidBeta42"
+
             ],
 
             "AB40": [
+
                 "AB40",
                 "Aβ40",
                 "Aβ-40",
                 "Amyloid_Beta_40",
                 "Amyloid Beta 40",
                 "AmyloidBeta40"
+
             ],
 
             "pTau181": [
+
                 "pTau181",
                 "p-tau181",
                 "p_tau181",
                 "PTAU181",
                 "pTau-181"
+
             ],
 
             "pTau217": [
+
                 "pTau217",
                 "p-tau217",
                 "p_tau217",
                 "PTAU217",
                 "pTau-217"
+
             ],
 
             "AB42_AB40_Ratio": [
+
                 "AB42_AB40_Ratio",
                 "AB42/AB40",
                 "Aβ42/Aβ40",
                 "Amyloid_Beta_Ratio",
                 "Amyloid Beta Ratio"
+
             ]
 
         }
@@ -875,7 +1067,9 @@ async def patient_predict(
                 )
 
 
-                if pd.isna(value):
+                if pd.isna(
+                    value
+                ):
 
                     biomarkers[
                         biomarker
@@ -886,16 +1080,19 @@ async def patient_predict(
                     biomarkers[
                         biomarker
                     ] = round(
-                        float(value),
+                        float(
+                            value
+                        ),
                         4
                     )
 
 
-        # ----------------------------------------------------
+        # ====================================================
         # CALCULATE RATIO IF NOT PROVIDED
-        # ----------------------------------------------------
+        # ====================================================
 
         if (
+
             biomarkers[
                 "AB42_AB40_Ratio"
             ] is None
@@ -911,21 +1108,29 @@ async def patient_predict(
             and biomarkers[
                 "AB40"
             ] != 0
+
         ):
 
             biomarkers[
                 "AB42_AB40_Ratio"
             ] = round(
-                biomarkers["AB42"]
+
+                biomarkers[
+                    "AB42"
+                ]
                 /
-                biomarkers["AB40"],
+                biomarkers[
+                    "AB40"
+                ],
+
                 4
+
             )
 
 
-        # ----------------------------------------------------
+        # ====================================================
         # RUN GNN
-        # ----------------------------------------------------
+        # ====================================================
 
         prediction_result = (
             run_gnn_prediction(
@@ -934,9 +1139,9 @@ async def patient_predict(
         )
 
 
-        # ----------------------------------------------------
+        # ====================================================
         # IMPORTANT GENE SIGNALS
-        # ----------------------------------------------------
+        # ====================================================
 
         important_features = (
             get_top_gene_signals(
@@ -945,9 +1150,9 @@ async def patient_predict(
         )
 
 
-        # ----------------------------------------------------
+        # ====================================================
         # OPTIONAL PROVIDED DIAGNOSIS
-        # ----------------------------------------------------
+        # ====================================================
 
         diagnosis_column = find_column(
             df,
@@ -981,23 +1186,29 @@ async def patient_predict(
                 )
 
 
-        # ----------------------------------------------------
+        # ====================================================
         # DATA VALIDATION
-        # ----------------------------------------------------
+        # ====================================================
 
         validation = {
 
             "required_gene_count":
-                len(selected_genes),
+                len(
+                    selected_genes
+                ),
 
             "provided_gene_count":
-                len(selected_genes),
+                len(
+                    selected_genes
+                ),
 
             "missing_gene_count":
                 0,
 
             "invalid_gene_count":
-                len(invalid_genes),
+                len(
+                    invalid_genes
+                ),
 
             "biomarkers_available":
                 sum(
@@ -1009,9 +1220,9 @@ async def patient_predict(
         }
 
 
-        # ----------------------------------------------------
+        # ====================================================
         # CLINICAL NOTE
-        # ----------------------------------------------------
+        # ====================================================
 
         clinical_note = (
             "This result is generated by a research "
@@ -1020,11 +1231,11 @@ async def patient_predict(
         )
 
 
-        # ----------------------------------------------------
-        # RETURN
-        # ----------------------------------------------------
+        # ====================================================
+        # PREPARE RESPONSE
+        # ====================================================
 
-        return {
+        response = {
 
             "status":
                 "success",
@@ -1077,7 +1288,9 @@ async def patient_predict(
                     "Weighted Improved GCN",
 
                 "selected_genes":
-                    len(selected_genes),
+                    len(
+                        selected_genes
+                    ),
 
                 "graph_edges":
                     int(
@@ -1085,7 +1298,9 @@ async def patient_predict(
                     ),
 
                 "device":
-                    str(device)
+                    str(
+                        device
+                    )
 
             },
 
@@ -1101,12 +1316,31 @@ async def patient_predict(
         }
 
 
+        # ====================================================
+        # CLEAN PATIENT OBJECTS
+        # ====================================================
+
+        del patient_row
+        del gene_column_map
+        del column_lookup
+        del df
+        del sample_values
+        del invalid_genes
+
+        gc.collect()
+
+
+        return response
+
+
     except HTTPException:
 
         raise
 
 
     except Exception as e:
+
+        gc.collect()
 
         raise HTTPException(
             status_code=500,
@@ -1115,7 +1349,7 @@ async def patient_predict(
 
 
 # ============================================================
-# RESEARCH DATASET PREDICTION - MEMORY OPTIMIZED
+# RESEARCH DATASET PREDICTION
 #
 # Expected:
 #
@@ -1130,16 +1364,17 @@ async def predict(
 
     try:
 
-        # ----------------------------------------------------
-        # READ CSV DIRECTLY FROM UPLOAD
-        # Avoid await file.read() because it creates another
-        # large copy of the entire CSV in RAM.
-        # ----------------------------------------------------
+        # ====================================================
+        # READ UPLOAD
+        # ====================================================
 
         uploaded_file = file.file
 
 
-        # Read only the header first
+        # ----------------------------------------------------
+        # Read only header first
+        # ----------------------------------------------------
+
         header_df = pd.read_csv(
             uploaded_file,
             nrows=0
@@ -1151,7 +1386,9 @@ async def predict(
         )
 
 
-        if "Gene_Symbol" not in header_df.columns:
+        if "Gene_Symbol" not in (
+            header_df.columns
+        ):
 
             raise HTTPException(
                 status_code=400,
@@ -1174,7 +1411,9 @@ async def predict(
         ]
 
 
-        if len(sample_columns) == 0:
+        if len(
+            sample_columns
+        ) == 0:
 
             raise HTTPException(
                 status_code=400,
@@ -1185,11 +1424,19 @@ async def predict(
             )
 
 
-        # ----------------------------------------------------
-        # READ DATA WITH FLOAT32
-        # ----------------------------------------------------
+        # Free header
+        del header_df
 
-        uploaded_file.seek(0)
+        gc.collect()
+
+
+        # ====================================================
+        # READ DATA
+        # ====================================================
+
+        uploaded_file.seek(
+            0
+        )
 
 
         dtype_map = {
@@ -1209,14 +1456,20 @@ async def predict(
         )
 
 
+        del dtype_map
+        del sample_columns
+
+        gc.collect()
+
+
+        # ====================================================
+        # CLEAN
+        # ====================================================
+
         df = clean_columns(
             df
         )
 
-
-        # ----------------------------------------------------
-        # REMOVE DUPLICATE GENES
-        # ----------------------------------------------------
 
         df = df.drop_duplicates(
             subset=[
@@ -1237,9 +1490,9 @@ async def predict(
         )
 
 
-        # ----------------------------------------------------
+        # ====================================================
         # CHECK REQUIRED GENES
-        # ----------------------------------------------------
+        # ====================================================
 
         missing_genes = [
 
@@ -1265,10 +1518,14 @@ async def predict(
                     ),
 
                     "missing_count":
-                        len(missing_genes),
+                        len(
+                            missing_genes
+                        ),
 
                     "required_genes":
-                        len(selected_genes),
+                        len(
+                            selected_genes
+                        ),
 
                     "example_missing_genes":
                         missing_genes[:30]
@@ -1277,24 +1534,26 @@ async def predict(
             )
 
 
-        # ----------------------------------------------------
-        # SELECT ONLY THE 1000 GENES NEEDED BY THE GNN
-        # ----------------------------------------------------
+        # ====================================================
+        # SELECT ONLY 1000 REQUIRED GENES
+        # ====================================================
 
         expression = df.loc[
             selected_genes
         ]
 
 
-        # ----------------------------------------------------
-        # CHECK MISSING / NON-NUMERIC VALUES
-        # ----------------------------------------------------
+        # ====================================================
+        # CHECK MISSING VALUES
+        # ====================================================
 
         if expression.isna().any().any():
 
-            bad_columns = expression.columns[
-                expression.isna().any()
-            ]
+            bad_columns = (
+                expression.columns[
+                    expression.isna().any()
+                ]
+            )
 
 
             bad_sample = str(
@@ -1311,9 +1570,9 @@ async def predict(
             )
 
 
-        # ----------------------------------------------------
+        # ====================================================
         # RUN GNN
-        # ----------------------------------------------------
+        # ====================================================
 
         results = []
 
@@ -1340,7 +1599,9 @@ async def predict(
             results.append({
 
                 "sample_id":
-                    str(sample_id),
+                    str(
+                        sample_id
+                    ),
 
                 "prediction":
                     prediction_result[
@@ -1360,23 +1621,27 @@ async def predict(
             })
 
 
-        # ----------------------------------------------------
+            del sample_values
+
+            gc.collect()
+
+
+        # ====================================================
         # DATASET BASIC INFORMATION
-        # ----------------------------------------------------
+        # ====================================================
 
         number_of_genes = len(
             df.index
         )
-
 
         number_of_samples = len(
             df.columns
         )
 
 
-        # ----------------------------------------------------
+        # ====================================================
         # DATASET STATISTICS
-        # ----------------------------------------------------
+        # ====================================================
 
         missing_values = int(
             df.isna()
@@ -1392,9 +1657,9 @@ async def predict(
         )
 
 
-        # ----------------------------------------------------
+        # ====================================================
         # TOP VARIABLE GENES
-        # ----------------------------------------------------
+        # ====================================================
 
         gene_variances = df.var(
             axis=1,
@@ -1404,7 +1669,9 @@ async def predict(
 
         top_variable_genes_series = (
             gene_variances
-            .nlargest(10)
+            .nlargest(
+                10
+            )
         )
 
 
@@ -1413,11 +1680,15 @@ async def predict(
             {
 
                 "gene":
-                    str(gene),
+                    str(
+                        gene
+                    ),
 
                 "variance":
                     round(
-                        float(variance),
+                        float(
+                            variance
+                        ),
                         6
                     )
 
@@ -1429,9 +1700,9 @@ async def predict(
         ]
 
 
-        # ----------------------------------------------------
+        # ====================================================
         # EXPRESSION OVERVIEW
-        # ----------------------------------------------------
+        # ====================================================
 
         expression_overview = []
 
@@ -1446,7 +1717,9 @@ async def predict(
             overview_genes = (
                 first_sample
                 .dropna()
-                .head(30)
+                .head(
+                    30
+                )
             )
 
 
@@ -1455,11 +1728,15 @@ async def predict(
                 {
 
                     "gene":
-                        str(gene),
+                        str(
+                            gene
+                        ),
 
                     "expression":
                         round(
-                            float(value),
+                            float(
+                                value
+                            ),
                             4
                         )
 
@@ -1471,18 +1748,30 @@ async def predict(
             ]
 
 
-        # ----------------------------------------------------
+        # ====================================================
+        # SAVE REQUIRED VALUES
+        # ====================================================
+
+        graph_edges = int(
+            edge_index.shape[1]
+        )
+
+
+        # ====================================================
         # FREE LARGE OBJECTS
-        # ----------------------------------------------------
+        # ====================================================
 
         del df
         del expression
         del gene_variances
+        del top_variable_genes_series
+
+        gc.collect()
 
 
-        # ----------------------------------------------------
+        # ====================================================
         # RETURN
-        # ----------------------------------------------------
+        # ====================================================
 
         return {
 
@@ -1493,7 +1782,9 @@ async def predict(
                 "research",
 
             "sample_count":
-                len(results),
+                len(
+                    results
+                ),
 
             "number_of_genes":
                 number_of_genes,
@@ -1520,12 +1811,12 @@ async def predict(
                 "Weighted Improved GCN",
 
             "selected_gene_count":
-                len(selected_genes),
+                len(
+                    selected_genes
+                ),
 
             "graph_edges":
-                int(
-                    edge_index.shape[1]
-                ),
+                graph_edges,
 
             "k_value":
                 10,
@@ -1542,6 +1833,8 @@ async def predict(
 
 
     except Exception as e:
+
+        gc.collect()
 
         raise HTTPException(
             status_code=500,
