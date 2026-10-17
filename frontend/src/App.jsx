@@ -1,5 +1,4 @@
-import React, { useState } from "react";
-
+import React, { useEffect, useState } from "react";
 import {
   Brain,
   Droplets,
@@ -41,12 +40,44 @@ import {
   Pie,
   Cell
 } from "recharts";
-
+import { supabase } from "./lib/supabase";
+import Login from "./Login";
 
 const API_URL = import.meta.env.VITE_API_URL || "http://127.0.0.1:8000";
 
 
 function App() {
+  const [authSession, setAuthSession] = useState(null);
+const [authLoading, setAuthLoading] = useState(true);
+
+useEffect(() => {
+  let mounted = true;
+
+  const {
+    data: { subscription },
+  } = supabase.auth.onAuthStateChange((_event, session) => {
+    if (mounted) {
+      setAuthSession(session);
+      setAuthLoading(false);
+    }
+  });
+
+  supabase.auth.getSession().then(({ data, error }) => {
+    if (!mounted) return;
+
+    if (error) {
+      console.error("Unable to restore session:", error.message);
+    }
+
+    setAuthSession(data.session);
+    setAuthLoading(false);
+  });
+
+  return () => {
+    mounted = false;
+    subscription.unsubscribe();
+  };
+}, []);
 
   // ========================================================
   // STATE
@@ -152,13 +183,13 @@ function App() {
         file
       );
 
-      const response = await fetch(
-        `${API_URL}/predict`,
-        {
-          method: "POST",
-          body: formData
-        }
-      );
+      const response = await fetch(`${API_URL}/patient-predict`, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${authSession.access_token}`,
+        },
+        body: formData,
+      });
 
       const data = await response.json();
 
@@ -292,13 +323,13 @@ function App() {
         file
       );
 
-      const response = await fetch(
-        `${API_URL}/predict`,
-        {
-          method: "POST",
-          body: formData
-        }
-      );
+      const response = await fetch(`${API_URL}/predict`, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${authSession.access_token}`,
+        },
+        body: formData,
+      });
 
       const data = await response.json();
 
@@ -1724,12 +1755,25 @@ function App() {
         </div>
 
         <div className="top-status">
+  <span className="status-dot" />
+  GNN API Connected
 
-          <span className="status-dot" />
+  <span>{authSession?.user?.email}</span>
 
-          GNN API Connected
+  <button
+    type="button"
+    className="button button-light"
+    onClick={async () => {
+      const { error } = await supabase.auth.signOut();
 
-        </div>
+      if (error) {
+        console.error("Sign out failed:", error.message);
+      }
+    }}
+  >
+    Sign out
+  </button>
+</div>
 
       </header>
 
@@ -3741,7 +3785,25 @@ function App() {
   // ========================================================
   // APP
   // ========================================================
-
+  if (authLoading) {
+    return (
+      <div
+        style={{
+          minHeight: "100vh",
+          display: "grid",
+          placeItems: "center",
+          fontFamily: "Arial, sans-serif",
+          color: "#26386f",
+        }}
+      >
+        Checking your session...
+      </div>
+    );
+  }
+  
+  if (!authSession) {
+    return <Login onLogin={setAuthSession} />;
+  }
   return (
 
     <>
