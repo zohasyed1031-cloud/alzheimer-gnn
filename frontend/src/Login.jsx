@@ -32,18 +32,44 @@ export default function Login({ onLogin }) {
 
   return (
     <main className="login-page">
-      <section className="login-card">
-        <div className="login-brand">
-          <div className="login-logo">N</div>
-          <div>
-            <h1>NeuroGraph AI</h1>
-            <p>Alzheimer's Detection Platform</p>
+      {/* Left panel: scientific visual and platform branding */}
+      <section className="login-visual">
+        <div className="visual-content">
+          <div className="visual-brand">
+            <div className="login-logo">N</div>
+            <span>NeuroGraph AI</span>
+          </div>
+
+          <div className="visual-message">
+            <p className="visual-eyebrow">
+              NEUROSCIENCE · ARTIFICIAL INTELLIGENCE
+            </p>
+
+            <h1>
+              Understanding the brain.
+              <br />
+              <span>Advancing early detection.</span>
+            </h1>
+
+            <p className="visual-description">
+              Exploring gene-expression patterns through graph neural
+              networks to support Alzheimer’s disease research.
+            </p>
           </div>
         </div>
 
+        <div className="visual-footer">
+          Research-driven AI <span>·</span> NeuroGraph Platform
+        </div>
+      </section>
+
+      {/* Right panel: login form */}
+      <section className="login-card">
         <div className="login-heading">
           <h2>Welcome back</h2>
-          <p>Sign in with your authorized lab technician account.</p>
+          <p>
+            Sign in with your authorized lab technician account.
+          </p>
         </div>
 
         <form onSubmit={handleLogin}>
@@ -69,7 +95,11 @@ export default function Login({ onLogin }) {
             required
           />
 
-          {error && <p className="login-error" role="alert">{error}</p>}
+          {error && (
+            <p className="login-error" role="alert">
+              {error}
+            </p>
+          )}
 
           <button type="submit" disabled={loading}>
             {loading ? 'Signing in...' : 'Sign in'}
