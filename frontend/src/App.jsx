@@ -160,69 +160,49 @@ useEffect(() => {
   // ========================================================
 
   const handleAnalyze = async () => {
-
     if (!file) {
-
-      setError(
-        "Please upload a research dataset first."
-      );
-
+      setError("Please upload a research dataset first.");
       return;
     }
-
+  
+    if (!authSession?.access_token) {
+      setError("Your session has expired. Please sign in again.");
+      return;
+    }
+  
     setLoading(true);
-
     setError("");
-
+  
     try {
-
+      console.log("Selected file:", file);
+      console.log("Is a real File:", file instanceof File);
       const formData = new FormData();
-
-      formData.append(
-        "file",
-        file
-      );
-
-      
-const response = await fetch(`${API_URL}/predict`, {
-  method: "POST",
-  headers: {
-    Authorization: `Bearer ${authSession.access_token}`,
-  },
-  body: formData,
-});
-
-
-      const data = await response.json();
-
+      formData.append("file", file);
+  
+      const response = await fetch(`${API_URL}/predict`, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${authSession.access_token}`,
+        },
+        body: formData,
+      });
+  
+      const data = await response.json().catch(() => ({}));
+  
       if (!response.ok) {
-
         throw new Error(
           data?.detail?.message ||
-          data?.detail ||
+          (typeof data?.detail === "string" ? data.detail : null) ||
           "Dataset analysis failed."
         );
       }
-
+  
       setResult(data);
-
       navigate("analysis");
-
-    }
-
-    catch (err) {
-
-      setError(
-        err.message ||
-        "Unable to analyze dataset."
-      );
-
-    }
-
-    finally {
-
+    } catch (err) {
+      setError(err.message || "Unable to analyze dataset.");
+    } finally {
       setLoading(false);
-
     }
   };
 
@@ -232,57 +212,52 @@ const response = await fetch(`${API_URL}/predict`, {
   // ========================================================
 
   const handlePatientAnalysis = async () => {
-
     if (!patientReport) {
-
-      setPredictionError(
-        "Please upload the patient's CSV report."
-      );
-
+      setPredictionError("Please upload the patient's CSV report.");
       return;
     }
-
+  
+    if (!authSession?.access_token) {
+      setPredictionError("Your session has expired. Please sign in again.");
+      return;
+    }
+  
     setPredictionLoading(true);
-
     setPredictionError("");
-
+  
     try {
-
       const formData = new FormData();
-formData.append("file", file);
+      formData.append("file", patientReport);
+      console.log("Patient file:", patientReport);
 
-const response = await fetch(`${API_URL}/predict`, {
-  method: "POST",
-  body: formData,
-});
-
-const data = await response.json();
-
-if (!response.ok) {
-  throw new Error(
-    data.detail?.message || data.detail || "Analysis failed"
-  );
-}
-
+      console.log("FormData file:", formData.get("file"));
+  
+      const response = await fetch(`${API_URL}/patient-predict`, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${authSession.access_token}`,
+        },
+        body: formData,
+      });
+  
+      const data = await response.json().catch(() => ({}));
+  
+      if (!response.ok) {
+        throw new Error(
+          data?.detail?.message ||
+          (typeof data?.detail === "string" ? data.detail : null) ||
+          "Patient analysis failed."
+        );
+      }
+  
       setPatientResult(data);
-
       navigate("patient");
-
-    }
-
-    catch (err) {
-
+    } catch (err) {
       setPredictionError(
-        err.message ||
-        "Unable to analyze patient report."
+        err.message || "Unable to analyze patient report."
       );
-
-    }
-
-    finally {
-
+    } finally {
       setPredictionLoading(false);
-
     }
   };
 
@@ -292,29 +267,23 @@ if (!response.ok) {
   // ========================================================
 
   const handleRunGNN = async () => {
-
     if (!file) {
-
-      setPredictionError(
-        "Please upload a research dataset first."
-      );
-
+      setPredictionError("Please upload a research dataset first.");
       return;
     }
-
+  
+    if (!authSession?.access_token) {
+      setPredictionError("Your session has expired. Please sign in again.");
+      return;
+    }
+  
     setPredictionLoading(true);
-
     setPredictionError("");
-
+  
     try {
-
       const formData = new FormData();
-
-      formData.append(
-        "file",
-        file
-      );
-
+      formData.append("file", file);
+  
       const response = await fetch(`${API_URL}/predict`, {
         method: "POST",
         headers: {
@@ -322,37 +291,23 @@ if (!response.ok) {
         },
         body: formData,
       });
-
-      const data = await response.json();
-
+  
+      const data = await response.json().catch(() => ({}));
+  
       if (!response.ok) {
-
         throw new Error(
           data?.detail?.message ||
-          data?.detail ||
+          (typeof data?.detail === "string" ? data.detail : null) ||
           "GNN prediction failed."
         );
       }
-
+  
       setResult(data);
-
       navigate("gnn");
-
-    }
-
-    catch (err) {
-
-      setPredictionError(
-        err.message ||
-        "Unable to run GNN."
-      );
-
-    }
-
-    finally {
-
+    } catch (err) {
+      setPredictionError(err.message || "Unable to run GNN.");
+    } finally {
       setPredictionLoading(false);
-
     }
   };
 
