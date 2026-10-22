@@ -594,15 +594,8 @@ def run_gnn_prediction(
     # Release temporary objects
     # --------------------------------------------------------
 
-    del x
-    del batch
-    del output
-    del probabilities
-    del sample_array
-    del sample_scaled
-
-    gc.collect()
-
+    del x, batch, output, probabilities
+    del sample_array, sample_scaled
 
     return {
 
@@ -1566,23 +1559,28 @@ async def predict(file: UploadFile = File(...)):
             )
 
         # Predict one sample at a time
-        print("CSV processing complete. Starting GNN predictions.", flush=True)
         results = []
 
-        for sample_index, sample_id in enumerate(sample_columns):
-            print(f"Predicting sample {sample_index + 1}/{number_of_samples}", flush=True)
-            sample_values = expression[:, sample_index]
+for sample_index, sample_id in enumerate(sample_columns):
+    if sample_index % 25 == 0:
+        print(
+            f"Research prediction progress: "
+            f"{sample_index}/{number_of_samples}",
+            flush=True
+        )
 
-            prediction_result = run_gnn_prediction(
-                sample_values
-            )
+    sample_values = expression[:, sample_index]
 
-            results.append({
-                "sample_id": str(sample_id),
-                "prediction": prediction_result["prediction"],
-                "confidence": prediction_result["confidence"],
-                "probabilities": prediction_result["probabilities"]
-            })
+    prediction_result = run_gnn_prediction(sample_values)
+
+    results.append({
+        "sample_id": str(sample_id),
+        "prediction": prediction_result["prediction"],
+        "confidence": prediction_result["confidence"],
+        "probabilities": prediction_result["probabilities"]
+    })
+
+print("All research predictions completed.", flush=True)
 
         del expression
         gc.collect()
