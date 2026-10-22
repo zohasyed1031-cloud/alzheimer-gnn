@@ -1365,485 +1365,264 @@ async def patient_predict(
 #
 # ============================================================
 
+# ============================================================
+# RESEARCH DATASET PREDICTION - CHUNKED FOR LOWER MEMORY
+# ============================================================
+
 @app.post("/predict")
-async def predict(
-    file: UploadFile = File(...)
-):
-
+async def predict(file: UploadFile = File(...)):
     try:
-
-        # ====================================================
-        # READ UPLOAD
-        # ====================================================
-
         uploaded_file = file.file
 
+        # Read the CSV header only
+        header_df = pd.read_csv(uploaded_file, nrows=0)
+        header_df = clean_columns(header_df)
 
-        # ----------------------------------------------------
-        # Read only header first
-        # ----------------------------------------------------
-
-        header_df = pd.read_csv(
-            uploaded_file,
-            nrows=0
-        )
-
-
-        header_df = clean_columns(
-            header_df
-        )
-
-
-        if "Gene_Symbol" not in (
-            header_df.columns
-        ):
-
+        if "Gene_Symbol" not in header_df.columns:
             raise HTTPException(
                 status_code=400,
-                detail=(
-                    "Research dataset must contain "
-                    "'Gene_Symbol' column."
-                )
+                detail="Research dataset must contain 'Gene_Symbol' column."
             )
-
 
         sample_columns = [
-
-            column
-
-            for column
-            in header_df.columns
-
-            if column != "Gene_Symbol"
-
+            col for col in header_df.columns
+            if col != "Gene_Symbol"
         ]
 
-
-        if len(
-            sample_columns
-        ) == 0:
-
+        if not sample_columns:
             raise HTTPException(
                 status_code=400,
-                detail=(
-                    "CSV must contain at least "
-                    "one sample column."
-                )
+                detail="CSV must contain at least one sample column."
             )
 
-
-        # Free header
+        number_of_samples = len(sample_columns)
+        print(f"Research upload: {number_of_samples} samples detected", flush=True)
         del header_df
-
         gc.collect()
 
+        uploaded_file.seek(0)
 
-        # ====================================================
-        # READ DATA
-        # ====================================================
+        # Store selected genes only; process the rest in chunks
+        selected_gene_set = set(selected_genes)
+        selected_expression = {}
+        seen_genes = set()
 
-        uploaded_file.seek(
-            0
-        )
+        missing_values = 0
+        expression_sum = 0.0
+        valid_value_count = 0
+        number_of_genes = 0
 
+        top_variances = []
+        expression_overview = []
 
         dtype_map = {
-
-            column:
-                np.float32
-
-            for column
-            in sample_columns
-
+            col: np.float32 for col in sample_columns
         }
 
-
-        df = pd.read_csv(
+        chunks = pd.read_csv(
             uploaded_file,
-            dtype=dtype_map
+            dtype=dtype_map,
+            chunksize=500
         )
-
 
         del dtype_map
-        del sample_columns
-
         gc.collect()
 
+        for chunk in chunks:
+            chunk = clean_columns(chunk)
 
-        # ====================================================
-        # CLEAN
-        # ====================================================
+            chunk["Gene_Symbol"] = (
+                chunk["Gene_Symbol"]
+                .astype(str)
+                .str.strip()
+            )
 
-        df = clean_columns(
-            df
-        )
+            # Preserve the first occurrence of each gene,
+            # including duplicates that span different chunks.
+            chunk = chunk.drop_duplicates(
+                subset=["Gene_Symbol"]
+            )
 
+            new_gene_mask = ~chunk["Gene_Symbol"].isin(
+                seen_genes
+            )
+            chunk = chunk.loc[new_gene_mask]
 
-        df = df.drop_duplicates(
-            subset=[
-                "Gene_Symbol"
-            ]
-        )
+            if chunk.empty:
+                del chunk
+                continue
 
+            gene_names = chunk["Gene_Symbol"].tolist()
+            seen_genes.update(gene_names)
+            number_of_genes += len(gene_names)
 
-        df["Gene_Symbol"] = (
-            df["Gene_Symbol"]
-            .astype(str)
-            .str.strip()
-        )
+            values = chunk[sample_columns]
 
+            # Accumulate dataset statistics
+            missing_values += int(
+                values.isna().sum().sum()
+            )
 
-        df = df.set_index(
-            "Gene_Symbol"
-        )
+            valid_count = int(values.count().sum())
 
+            if valid_count:
+                expression_sum += float(
+                    values.sum().sum()
+                )
+                valid_value_count += valid_count
 
-        # ====================================================
-        # CHECK REQUIRED GENES
-        # ====================================================
+            # Keep the first 30 genes for the expression overview
+            if len(expression_overview) < 30 and number_of_samples:
+                first_sample = sample_columns[0]
 
+                for gene, value in zip(
+                    gene_names,
+                    chunk[first_sample].tolist()
+                ):
+                    if len(expression_overview) >= 30:
+                        break
+
+                    if pd.notna(value):
+                        expression_overview.append({
+                            "gene": str(gene),
+                            "expression": round(float(value), 4)
+                        })
+
+            # Track the ten genes with highest variance
+            variances = values.var(axis=1, ddof=1)
+
+            for gene, variance in zip(
+                gene_names, variances.tolist()
+            ):
+                if pd.notna(variance):
+                    top_variances.append(
+                        (str(gene), float(variance))
+                    )
+
+            top_variances = sorted(
+                top_variances,
+                key=lambda item: item[1],
+                reverse=True
+            )[:10]
+
+            # Retain expression values only for model genes
+            selected_mask = chunk["Gene_Symbol"].isin(
+                selected_gene_set
+            )
+
+            selected_rows = chunk.loc[selected_mask]
+
+            for _, row in selected_rows.iterrows():
+                gene = row["Gene_Symbol"]
+
+                if gene not in selected_expression:
+                    selected_expression[gene] = (
+                        row[sample_columns]
+                        .to_numpy(dtype=np.float32, copy=True)
+                    )
+
+            del values, variances, selected_rows, chunk
+            gc.collect()
+
+        # Check that all required model genes were found
         missing_genes = [
-
-            gene
-
-            for gene
-            in selected_genes
-
-            if gene not in df.index
-
+            gene for gene in selected_genes
+            if gene not in selected_expression
         ]
 
-
         if missing_genes:
-
             raise HTTPException(
                 status_code=400,
                 detail={
-
                     "message": (
-                        "Uploaded dataset is missing "
-                        "required genes."
+                        "Uploaded dataset is missing required genes."
                     ),
-
-                    "missing_count":
-                        len(
-                            missing_genes
-                        ),
-
-                    "required_genes":
-                        len(
-                            selected_genes
-                        ),
-
-                    "example_missing_genes":
-                        missing_genes[:30]
-
+                    "missing_count": len(missing_genes),
+                    "required_genes": len(selected_genes),
+                    "example_missing_genes": missing_genes[:30]
                 }
             )
 
+        # Reconstruct only the small 1000-gene expression matrix
+        expression = np.stack(
+            [selected_expression[gene] for gene in selected_genes],
+            axis=0
+        )
 
-        # ====================================================
-        # SELECT ONLY 1000 REQUIRED GENES
-        # ====================================================
+        del selected_expression
+        gc.collect()
 
-        expression = df.loc[
-            selected_genes
-        ]
-
-
-        # ====================================================
-        # CHECK MISSING VALUES
-        # ====================================================
-
-        if expression.isna().any().any():
-
-            bad_columns = (
-                expression.columns[
-                    expression.isna().any()
-                ]
-            )
-
-
-            bad_sample = str(
-                bad_columns[0]
-            )
-
+        # Validate values for genes used by the GNN
+        if not np.isfinite(expression).all():
+            del expression
+            gc.collect()
 
             raise HTTPException(
                 status_code=400,
                 detail=(
-                    "Non-numeric or missing values "
-                    f"found in sample {bad_sample}."
+                    "Required genes contain missing, non-numeric, "
+                    "or non-finite values."
                 )
             )
 
-
-        # ====================================================
-        # RUN GNN
-        # ====================================================
-
+        # Predict one sample at a time
+        print("CSV processing complete. Starting GNN predictions.", flush=True)
         results = []
 
+        for sample_index, sample_id in enumerate(sample_columns):
+            print(f"Predicting sample {sample_index + 1}/{number_of_samples}", flush=True)
+            sample_values = expression[:, sample_index]
 
-        for sample_id in expression.columns:
-
-            sample_values = (
-                expression[
-                    sample_id
-                ]
-                .to_numpy(
-                    dtype=np.float32
-                )
+            prediction_result = run_gnn_prediction(
+                sample_values
             )
-
-
-            prediction_result = (
-                run_gnn_prediction(
-                    sample_values
-                )
-            )
-
 
             results.append({
-
-                "sample_id":
-                    str(
-                        sample_id
-                    ),
-
-                "prediction":
-                    prediction_result[
-                        "prediction"
-                    ],
-
-                "confidence":
-                    prediction_result[
-                        "confidence"
-                    ],
-
-                "probabilities":
-                    prediction_result[
-                        "probabilities"
-                    ]
-
+                "sample_id": str(sample_id),
+                "prediction": prediction_result["prediction"],
+                "confidence": prediction_result["confidence"],
+                "probabilities": prediction_result["probabilities"]
             })
 
+        del expression
+        gc.collect()
 
-            del sample_values
-
-            gc.collect()
-
-
-        # ====================================================
-        # DATASET BASIC INFORMATION
-        # ====================================================
-
-        number_of_genes = len(
-            df.index
+        mean_expression = (
+            expression_sum / valid_value_count
+            if valid_value_count
+            else 0.0
         )
-
-        number_of_samples = len(
-            df.columns
-        )
-
-
-        # ====================================================
-        # DATASET STATISTICS
-        # ====================================================
-
-        missing_values = int(
-            df.isna()
-            .sum()
-            .sum()
-        )
-
-
-        mean_expression = float(
-            df.to_numpy(
-                dtype=np.float32
-            ).mean()
-        )
-
-
-        # ====================================================
-        # TOP VARIABLE GENES
-        # ====================================================
-
-        gene_variances = df.var(
-            axis=1,
-            ddof=1
-        )
-
-
-        top_variable_genes_series = (
-            gene_variances
-            .nlargest(
-                10
-            )
-        )
-
 
         top_variable_genes = [
-
             {
-
-                "gene":
-                    str(
-                        gene
-                    ),
-
-                "variance":
-                    round(
-                        float(
-                            variance
-                        ),
-                        6
-                    )
-
+                "gene": gene,
+                "variance": round(variance, 6)
             }
-
-            for gene, variance
-            in top_variable_genes_series.items()
-
+            for gene, variance in top_variances
         ]
 
-
-        # ====================================================
-        # EXPRESSION OVERVIEW
-        # ====================================================
-
-        expression_overview = []
-
-
-        if number_of_samples > 0:
-
-            first_sample = (
-                df.iloc[:, 0]
-            )
-
-
-            overview_genes = (
-                first_sample
-                .dropna()
-                .head(
-                    30
-                )
-            )
-
-
-            expression_overview = [
-
-                {
-
-                    "gene":
-                        str(
-                            gene
-                        ),
-
-                    "expression":
-                        round(
-                            float(
-                                value
-                            ),
-                            4
-                        )
-
-                }
-
-                for gene, value
-                in overview_genes.items()
-
-            ]
-
-
-        # ====================================================
-        # SAVE REQUIRED VALUES
-        # ====================================================
-
-        graph_edges = int(
-            edge_index.shape[1]
-        )
-
-
-        # ====================================================
-        # FREE LARGE OBJECTS
-        # ====================================================
-
-        del df
-        del expression
-        del gene_variances
-        del top_variable_genes_series
-
-        gc.collect()
-
-
-        # ====================================================
-        # RETURN
-        # ====================================================
-
         return {
-
-            "status":
-                "success",
-
-            "dataset_type":
-                "research",
-
-            "sample_count":
-                len(
-                    results
-                ),
-
-            "number_of_genes":
-                number_of_genes,
-
-            "number_of_samples":
-                number_of_samples,
-
-            "missing_values":
-                missing_values,
-
-            "mean_expression":
-                round(
-                    mean_expression,
-                    4
-                ),
-
-            "top_variable_genes":
-                top_variable_genes,
-
-            "expression_overview":
-                expression_overview,
-
-            "model":
-                "Weighted Improved GCN",
-
-            "selected_gene_count":
-                len(
-                    selected_genes
-                ),
-
-            "graph_edges":
-                graph_edges,
-
-            "k_value":
-                10,
-
-            "results":
-                results
-
+            "status": "success",
+            "dataset_type": "research",
+            "sample_count": len(results),
+            "number_of_genes": number_of_genes,
+            "number_of_samples": number_of_samples,
+            "missing_values": missing_values,
+            "mean_expression": round(mean_expression, 4),
+            "top_variable_genes": top_variable_genes,
+            "expression_overview": expression_overview,
+            "model": "Weighted Improved GCN",
+            "selected_gene_count": len(selected_genes),
+            "graph_edges": int(edge_index.shape[1]),
+            "k_value": 10,
+            "results": results
         }
 
-
     except HTTPException:
-
         raise
 
-
     except Exception as e:
-
         gc.collect()
-
         raise HTTPException(
             status_code=500,
             detail=str(e)
