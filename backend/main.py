@@ -47,13 +47,30 @@ app = FastAPI(
 
 
 
+default_origins = [
+    "https://alzheimer-gnn.vercel.app",
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+]
+
+configured_origins = os.getenv(
+    "FRONTEND_ORIGINS",
+    ""
+).split(",")
+
+allowed_origins = list(dict.fromkeys(
+    origin.strip().rstrip("/")
+    for origin in [
+        *default_origins,
+        *configured_origins,
+    ]
+    if origin.strip()
+))
+
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "https://alzheimer-gnn.vercel.app",
-        "http://localhost:5173",
-        "http://127.0.0.1:5173",
-    ],
+    allow_origins=allowed_origins,
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -594,8 +611,15 @@ def run_gnn_prediction(
     # Release temporary objects
     # --------------------------------------------------------
 
-    del x, batch, output, probabilities
-    del sample_array, sample_scaled
+    del x
+    del batch
+    del output
+    del probabilities
+    del sample_array
+    del sample_scaled
+
+    gc.collect()
+
 
     return {
 
@@ -609,6 +633,216 @@ def run_gnn_prediction(
             probability_values
 
     }
+
+
+def run_gnn_predictions_batch(
+    expression,
+    batch_size=4
+):
+
+    if expression.empty:
+
+        return []
+
+
+    sample_ids = expression.columns
+    num_samples = len(sample_ids)
+    num_genes = len(selected_genes)
+
+    results = []
+
+
+    with torch.inference_mode():
+
+        for start in range(
+            0,
+            num_samples,
+            batch_size
+        ):
+
+            end = min(
+                start + batch_size,
+                num_samples
+            )
+
+            current_batch = end - start
+
+
+            sample_matrix = (
+                expression
+                .iloc[:, start:end]
+                .to_numpy(
+                    dtype=np.float32,
+                    copy=False
+                )
+                .T
+            )
+
+            chunk = scaler.transform(
+                sample_matrix
+            )
+
+            chunk = np.asarray(
+                chunk,
+                dtype=np.float32
+            )
+
+
+            x = torch.from_numpy(
+                chunk.reshape(
+                    -1,
+                    1
+                )
+            ).to(
+                device
+            )
+
+
+            batch = torch.arange(
+                current_batch,
+                device=device,
+                dtype=torch.long
+            ).repeat_interleave(
+                num_genes
+            )
+
+
+            edge_offsets = (
+                torch.arange(
+                    current_batch,
+                    device=device,
+                    dtype=torch.long
+                ) * num_genes
+            ).view(
+                -1,
+                1,
+                1
+            )
+
+            expanded_edge_index = (
+                edge_index.unsqueeze(
+                    0
+                ) + edge_offsets
+            )
+
+            batched_edge_index = (
+                expanded_edge_index
+                .permute(
+                    1,
+                    0,
+                    2
+                )
+                .reshape(
+                    2,
+                    -1
+                )
+            )
+
+            batched_edge_weight = edge_weight.repeat(
+                current_batch
+            )
+
+
+            output = model(
+                x,
+                batched_edge_index,
+                batched_edge_weight,
+                batch
+            )
+
+            probabilities = torch.softmax(
+                output,
+                dim=1
+            ).cpu().numpy()
+
+            predicted_classes = np.argmax(
+                probabilities,
+                axis=1
+            )
+
+
+            for idx in range(
+                current_batch
+            ):
+
+                sample_probs = probabilities[
+                    idx
+                ]
+
+                prediction = CLASS_NAMES[
+                    int(
+                        predicted_classes[
+                            idx
+                        ]
+                    )
+                ]
+
+                probability_values = {
+
+                    "AD":
+                        round(
+                            float(
+                                sample_probs[0]
+                            ) * 100,
+                            2
+                        ),
+
+                    "CTL":
+                        round(
+                            float(
+                                sample_probs[1]
+                            ) * 100,
+                            2
+                        ),
+
+                    "MCI":
+                        round(
+                            float(
+                                sample_probs[2]
+                            ) * 100,
+                            2
+                        )
+
+                }
+
+                results.append({
+
+                    "sample_id":
+                        str(
+                            sample_ids[
+                                start + idx
+                            ]
+                        ),
+
+                    "prediction":
+                        prediction,
+
+                    "confidence":
+                        probability_values[
+                            prediction
+                        ],
+
+                    "probabilities":
+                        probability_values
+
+                })
+
+
+            del chunk
+            del sample_matrix
+            del x
+            del batch
+            del edge_offsets
+            del expanded_edge_index
+            del batched_edge_index
+            del batched_edge_weight
+            del output
+            del probabilities
+            del predicted_classes
+
+    gc.collect()
+
+    return results
 
 
 # ============================================================
@@ -1358,273 +1592,536 @@ async def patient_predict(
 #
 # ============================================================
 
-# ============================================================
-# RESEARCH DATASET PREDICTION - CHUNKED FOR LOWER MEMORY
-# ============================================================
-
 @app.post("/predict")
-async def predict(file: UploadFile = File(...)):
+async def predict(
+    file: UploadFile = File(...)
+):
+
     try:
+
+        # ====================================================
+        # READ UPLOAD
+        # ====================================================
+
         uploaded_file = file.file
 
-        # Read the CSV header only
-        header_df = pd.read_csv(uploaded_file, nrows=0)
-        header_df = clean_columns(header_df)
 
-        if "Gene_Symbol" not in header_df.columns:
-            raise HTTPException(
-                status_code=400,
-                detail="Research dataset must contain 'Gene_Symbol' column."
-            )
+        # ----------------------------------------------------
+        # Read only header first
+        # ----------------------------------------------------
 
-        sample_columns = [
-            col for col in header_df.columns
-            if col != "Gene_Symbol"
-        ]
-
-        if not sample_columns:
-            raise HTTPException(
-                status_code=400,
-                detail="CSV must contain at least one sample column."
-            )
-
-        number_of_samples = len(sample_columns)
-        print(f"Research upload: {number_of_samples} samples detected", flush=True)
-        del header_df
-        gc.collect()
-
-        uploaded_file.seek(0)
-
-        # Store selected genes only; process the rest in chunks
-        selected_gene_set = set(selected_genes)
-        selected_expression = {}
-        seen_genes = set()
-
-        missing_values = 0
-        expression_sum = 0.0
-        valid_value_count = 0
-        number_of_genes = 0
-
-        top_variances = []
-        expression_overview = []
-
-        dtype_map = {
-            col: np.float32 for col in sample_columns
-        }
-
-        chunks = pd.read_csv(
+        header_df = pd.read_csv(
             uploaded_file,
-            dtype=dtype_map,
-            chunksize=500
+            nrows=0
         )
 
-        del dtype_map
-        gc.collect()
 
-        for chunk in chunks:
-            chunk = clean_columns(chunk)
-
-            chunk["Gene_Symbol"] = (
-                chunk["Gene_Symbol"]
-                .astype(str)
-                .str.strip()
-            )
-
-            # Preserve the first occurrence of each gene,
-            # including duplicates that span different chunks.
-            chunk = chunk.drop_duplicates(
-                subset=["Gene_Symbol"]
-            )
-
-            new_gene_mask = ~chunk["Gene_Symbol"].isin(
-                seen_genes
-            )
-            chunk = chunk.loc[new_gene_mask]
-
-            if chunk.empty:
-                del chunk
-                continue
-
-            gene_names = chunk["Gene_Symbol"].tolist()
-            seen_genes.update(gene_names)
-            number_of_genes += len(gene_names)
-
-            values = chunk[sample_columns]
-
-            # Accumulate dataset statistics
-            missing_values += int(
-                values.isna().sum().sum()
-            )
-
-            valid_count = int(values.count().sum())
-
-            if valid_count:
-                expression_sum += float(
-                    values.sum().sum()
-                )
-                valid_value_count += valid_count
-
-            # Keep the first 30 genes for the expression overview
-            if len(expression_overview) < 30 and number_of_samples:
-                first_sample = sample_columns[0]
-
-                for gene, value in zip(
-                    gene_names,
-                    chunk[first_sample].tolist()
-                ):
-                    if len(expression_overview) >= 30:
-                        break
-
-                    if pd.notna(value):
-                        expression_overview.append({
-                            "gene": str(gene),
-                            "expression": round(float(value), 4)
-                        })
-
-            # Track the ten genes with highest variance
-            variances = values.var(axis=1, ddof=1)
-
-            for gene, variance in zip(
-                gene_names, variances.tolist()
-            ):
-                if pd.notna(variance):
-                    top_variances.append(
-                        (str(gene), float(variance))
-                    )
-
-            top_variances = sorted(
-                top_variances,
-                key=lambda item: item[1],
-                reverse=True
-            )[:10]
-
-            # Retain expression values only for model genes
-            selected_mask = chunk["Gene_Symbol"].isin(
-                selected_gene_set
-            )
-
-            selected_rows = chunk.loc[selected_mask]
-
-            for _, row in selected_rows.iterrows():
-                gene = row["Gene_Symbol"]
-
-                if gene not in selected_expression:
-                    selected_expression[gene] = (
-                        row[sample_columns]
-                        .to_numpy(dtype=np.float32, copy=True)
-                    )
-
-            del values, variances, selected_rows, chunk
-            gc.collect()
-
-        # Check that all required model genes were found
-        missing_genes = [
-            gene for gene in selected_genes
-            if gene not in selected_expression
-        ]
-
-        if missing_genes:
-            raise HTTPException(
-                status_code=400,
-                detail={
-                    "message": (
-                        "Uploaded dataset is missing required genes."
-                    ),
-                    "missing_count": len(missing_genes),
-                    "required_genes": len(selected_genes),
-                    "example_missing_genes": missing_genes[:30]
-                }
-            )
-
-        # Reconstruct only the small 1000-gene expression matrix
-        expression = np.stack(
-            [selected_expression[gene] for gene in selected_genes],
-            axis=0
+        header_df = clean_columns(
+            header_df
         )
 
-        del selected_expression
-        gc.collect()
 
-        # Validate values for genes used by the GNN
-        if not np.isfinite(expression).all():
-            del expression
-            gc.collect()
+        if "Gene_Symbol" not in (
+            header_df.columns
+        ):
 
             raise HTTPException(
                 status_code=400,
                 detail=(
-                    "Required genes contain missing, non-numeric, "
-                    "or non-finite values."
+                    "Research dataset must contain "
+                    "'Gene_Symbol' column."
                 )
             )
 
-        # Predict one sample at a time
-        results = []
 
-                
+        sample_columns = [
 
-        for sample_index, sample_id in enumerate(sample_columns):
-            if sample_index % 25 == 0:
-                print(
-                    f"Research prediction progress: "
-                    f"{sample_index}/{number_of_samples}",
-                    flush=True
+            column
+
+            for column
+            in header_df.columns
+
+            if column != "Gene_Symbol"
+
+        ]
+
+
+        if len(
+            sample_columns
+        ) == 0:
+
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "CSV must contain at least "
+                    "one sample column."
+                )
+            )
+
+
+        # ====================================================
+        # READ DATA
+        # ====================================================
+
+        uploaded_file.seek(
+            0
+        )
+
+
+        df = pd.read_csv(
+            uploaded_file,
+            usecols=lambda column: (
+                str(column).strip() == "Gene_Symbol"
+                or str(column).strip() in sample_columns
+            )
+        )
+
+        df = clean_columns(
+            df
+        )
+
+        numeric_sample_columns = []
+
+        for column in sample_columns:
+
+            if column not in df.columns:
+
+                continue
+
+            numeric_values = pd.to_numeric(
+                df[
+                    column
+                ],
+                errors="coerce"
+            )
+
+            if numeric_values.notna().any():
+
+                numeric_sample_columns.append(
+                    column
                 )
 
-            sample_values = expression[:, sample_index]
+                df[column] = numeric_values.astype(
+                    np.float32
+                )
 
-            prediction_result = run_gnn_prediction(sample_values)
+            del numeric_values
 
-            results.append({
-                "sample_id": str(sample_id),
-                "prediction": prediction_result["prediction"],
-                "confidence": prediction_result["confidence"],
-                "probabilities": prediction_result["probabilities"]
-            })
 
-        print("All research predictions completed.", flush=True)
+        if len(
+            numeric_sample_columns
+        ) == 0:
 
-        del expression
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "No numeric sample columns were found. "
+                    "Keep 'Gene_Symbol' plus numeric sample columns only."
+                )
+            )
+
+
+        df = df[
+            [
+                "Gene_Symbol",
+                *numeric_sample_columns
+            ]
+        ]
+
+
+        del sample_columns
+        del header_df
+
         gc.collect()
 
+
+        # ====================================================
+        # CLEAN
+        # ====================================================
+
+        df = clean_columns(
+            df
+        )
+
+
+        df["Gene_Symbol"] = (
+            df["Gene_Symbol"]
+            .astype(str)
+            .str.strip()
+        )
+
+        df = df[
+            df["Gene_Symbol"].ne("")
+            & df["Gene_Symbol"].str.lower().ne("nan")
+        ]
+
+        df = df.drop_duplicates(
+            subset=[
+                "Gene_Symbol"
+            ]
+        )
+
+
+        df = df.set_index(
+            "Gene_Symbol"
+        )
+
+
+        # ====================================================
+        # CHECK REQUIRED GENES
+        # ====================================================
+
+        missing_genes = [
+
+            gene
+
+            for gene
+            in selected_genes
+
+            if gene not in df.index
+
+        ]
+
+
+        if missing_genes:
+
+            raise HTTPException(
+                status_code=400,
+                detail={
+
+                    "message": (
+                        "Uploaded dataset is missing "
+                        "required genes."
+                    ),
+
+                    "missing_count":
+                        len(
+                            missing_genes
+                        ),
+
+                    "required_genes":
+                        len(
+                            selected_genes
+                        ),
+
+                    "example_missing_genes":
+                        missing_genes[:30]
+
+                }
+            )
+
+
+        # ====================================================
+        # SELECT ONLY 1000 REQUIRED GENES
+        # ====================================================
+
+        expression = df.loc[
+            selected_genes
+        ]
+
+
+        # ====================================================
+        # CHECK MISSING VALUES
+        # ====================================================
+
+        for sample_column in numeric_sample_columns:
+
+            sample_values = df[
+                sample_column
+            ].to_numpy(
+                dtype=np.float32
+            )
+
+            if np.isinf(
+                sample_values
+            ).any():
+
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "Infinite values found in sample "
+                        f"{sample_column}."
+                    )
+                )
+
+            del sample_values
+
+
+        for sample_column in expression.columns:
+
+            sample_values = expression[
+                sample_column
+            ].to_numpy(
+                dtype=np.float32
+            )
+
+            if not np.isfinite(
+                sample_values
+            ).all():
+
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "Non-numeric or missing values found in sample "
+                        f"{sample_column}."
+                    )
+                )
+
+            del sample_values
+
+
+        # ====================================================
+        # RUN GNN
+        # ====================================================
+
+        results = run_gnn_predictions_batch(
+            expression
+        )
+
+
+        # ====================================================
+        # DATASET BASIC INFORMATION
+        # ====================================================
+
+        number_of_genes = len(
+            df.index
+        )
+
+        number_of_samples = len(
+            numeric_sample_columns
+        )
+
+
+        # ====================================================
+        # DATASET STATISTICS
+        # ====================================================
+
+        missing_values = int(
+            df.isna()
+            .sum()
+            .sum()
+        )
+
+
+        finite_sum = 0.0
+        finite_count = 0
+
+        for sample_column in numeric_sample_columns:
+
+            sample_values = df[
+                sample_column
+            ].to_numpy(
+                dtype=np.float32
+            )
+
+            valid_values = sample_values[
+                np.isfinite(
+                    sample_values
+                )
+            ]
+
+            finite_sum += float(
+                valid_values.sum(
+                    dtype=np.float64
+                )
+            )
+
+            finite_count += len(
+                valid_values
+            )
+
+            del sample_values
+            del valid_values
+
         mean_expression = (
-            expression_sum / valid_value_count
-            if valid_value_count
+            finite_sum / finite_count
+            if finite_count
             else 0.0
         )
 
+
+        # ====================================================
+        # TOP VARIABLE GENES
+        # ====================================================
+
+        gene_variances = df[
+            numeric_sample_columns
+        ].var(
+            axis=1,
+            ddof=1
+        ).dropna()
+
+
+        top_variable_genes_series = (
+            gene_variances
+            .nlargest(
+                10
+            )
+        )
+
+
         top_variable_genes = [
+
             {
-                "gene": gene,
-                "variance": round(variance, 6)
+
+                "gene":
+                    str(
+                        gene
+                    ),
+
+                "variance":
+                    round(
+                        float(
+                            variance
+                        ),
+                        6
+                    )
+
             }
-            for gene, variance in top_variances
+
+            for gene, variance
+            in top_variable_genes_series.items()
+
         ]
 
+
+        # ====================================================
+        # EXPRESSION OVERVIEW
+        # ====================================================
+
+        expression_overview = []
+
+
+        if number_of_samples > 0:
+
+            first_sample = (
+                df.iloc[:, 0]
+            )
+
+
+            overview_genes = (
+                first_sample
+                .dropna()
+                .head(
+                    30
+                )
+            )
+
+
+            expression_overview = [
+
+                {
+
+                    "gene":
+                        str(
+                            gene
+                        ),
+
+                    "expression":
+                        round(
+                            float(
+                                value
+                            ),
+                            4
+                        )
+
+                }
+
+                for gene, value
+                in overview_genes.items()
+
+            ]
+
+
+        # ====================================================
+        # SAVE REQUIRED VALUES
+        # ====================================================
+
+        graph_edges = int(
+            edge_index.shape[1]
+        )
+
+
+        # ====================================================
+        # FREE LARGE OBJECTS
+        # ====================================================
+
+        del df
+        del expression
+        del gene_variances
+        del top_variable_genes_series
+
+        gc.collect()
+
+
+        # ====================================================
+        # RETURN
+        # ====================================================
+
         return {
-            "status": "success",
-            "dataset_type": "research",
-            "sample_count": len(results),
-            "number_of_genes": number_of_genes,
-            "number_of_samples": number_of_samples,
-            "missing_values": missing_values,
-            "mean_expression": round(mean_expression, 4),
-            "top_variable_genes": top_variable_genes,
-            "expression_overview": expression_overview,
-            "model": "Weighted Improved GCN",
-            "selected_gene_count": len(selected_genes),
-            "graph_edges": int(edge_index.shape[1]),
-            "k_value": 10,
-            "results": results
+
+            "status":
+                "success",
+
+            "dataset_type":
+                "research",
+
+            "sample_count":
+                len(
+                    results
+                ),
+
+            "number_of_genes":
+                number_of_genes,
+
+            "number_of_samples":
+                number_of_samples,
+
+            "missing_values":
+                missing_values,
+
+            "mean_expression":
+                round(
+                    mean_expression,
+                    4
+                ),
+
+            "top_variable_genes":
+                top_variable_genes,
+
+            "expression_overview":
+                expression_overview,
+
+            "model":
+                "Weighted Improved GCN",
+
+            "selected_gene_count":
+                len(
+                    selected_genes
+                ),
+
+            "graph_edges":
+                graph_edges,
+
+            "k_value":
+                10,
+
+            "results":
+                results
+
         }
 
+
     except HTTPException:
+
         raise
 
+
     except Exception as e:
+
         gc.collect()
+
         raise HTTPException(
             status_code=500,
             detail=str(e)
         )
-        
