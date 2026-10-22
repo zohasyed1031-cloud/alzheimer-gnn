@@ -183,13 +183,15 @@ useEffect(() => {
         file
       );
 
-      const response = await fetch(`${API_URL}/patient-predict`, {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${authSession.access_token}`,
-        },
-        body: formData,
-      });
+      
+const response = await fetch(`${API_URL}/predict`, {
+  method: "POST",
+  headers: {
+    Authorization: `Bearer ${authSession.access_token}`,
+  },
+  body: formData,
+});
+
 
       const data = await response.json();
 
@@ -247,30 +249,20 @@ useEffect(() => {
     try {
 
       const formData = new FormData();
+formData.append("file", file);
 
-      formData.append(
-        "file",
-        patientReport
-      );
+const response = await fetch(`${API_URL}/predict`, {
+  method: "POST",
+  body: formData,
+});
 
-      const response = await fetch(
-        `${API_URL}/patient-predict`,
-        {
-          method: "POST",
-          body: formData
-        }
-      );
+const data = await response.json();
 
-      const data = await response.json();
-
-      if (!response.ok) {
-
-        throw new Error(
-          data?.detail?.message ||
-          data?.detail ||
-          "Patient analysis failed."
-        );
-      }
+if (!response.ok) {
+  throw new Error(
+    data.detail?.message || data.detail || "Analysis failed"
+  );
+}
 
       setPatientResult(data);
 
