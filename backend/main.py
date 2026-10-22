@@ -1561,26 +1561,28 @@ async def predict(file: UploadFile = File(...)):
         # Predict one sample at a time
         results = []
 
-for sample_index, sample_id in enumerate(sample_columns):
-    if sample_index % 25 == 0:
-        print(
-            f"Research prediction progress: "
-            f"{sample_index}/{number_of_samples}",
-            flush=True
-        )
+                
 
-    sample_values = expression[:, sample_index]
+        for sample_index, sample_id in enumerate(sample_columns):
+            if sample_index % 25 == 0:
+                print(
+                    f"Research prediction progress: "
+                    f"{sample_index}/{number_of_samples}",
+                    flush=True
+                )
 
-    prediction_result = run_gnn_prediction(sample_values)
+            sample_values = expression[:, sample_index]
 
-    results.append({
-        "sample_id": str(sample_id),
-        "prediction": prediction_result["prediction"],
-        "confidence": prediction_result["confidence"],
-        "probabilities": prediction_result["probabilities"]
-    })
+            prediction_result = run_gnn_prediction(sample_values)
 
-print("All research predictions completed.", flush=True)
+            results.append({
+                "sample_id": str(sample_id),
+                "prediction": prediction_result["prediction"],
+                "confidence": prediction_result["confidence"],
+                "probabilities": prediction_result["probabilities"]
+            })
+
+        print("All research predictions completed.", flush=True)
 
         del expression
         gc.collect()
@@ -1625,3 +1627,4 @@ print("All research predictions completed.", flush=True)
             status_code=500,
             detail=str(e)
         )
+        
