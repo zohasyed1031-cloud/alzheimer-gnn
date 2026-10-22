@@ -1595,7 +1595,8 @@ async def patient_predict(
 @app.post("/predict")
 async def predict(
     file: UploadFile = File(...)
-):
+):    
+    print("DEBUG: /predict handler reached", flush=True)
 
     try:
 
